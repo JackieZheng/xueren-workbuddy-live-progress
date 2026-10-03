@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 运行期产物（面板截图、采样缓存、临时文件）
+cache/
+*.log
+
+# 本机私有配置（脱敏规则的本地补充，绝不入库）
+*.local.json
+sensitive_paths.local.json
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 发布流程临时产物
+.tmp-publish-skillhub/
+.tmp_verify/
+
+# 前端调试用的 playwright 持久化 profile（体积大且全是本机私有数据，绝不入库）
+.pwprofile/
+
+# 开发日志 —— 不随仓库发布（用户约定）
+DEVLOG.md
