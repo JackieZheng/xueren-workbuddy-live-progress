@@ -6,6 +6,7 @@
     python scripts/panel_ctl.py status   [--port 8791] [--json]
     python scripts/panel_ctl.py check    [--port 8791] [--json]   # 面板会不会拖住当前会话？
     python scripts/panel_ctl.py start    [--port 8791] [--no-browser] [--auto] [--idle-exit 秒] [--json]
+    python scripts/panel_ctl.py spawn    [--port 8791] [--json]   # 只发起不等待（hook 兜底，秒回）
     python scripts/panel_ctl.py stop     [--port 8791] [--json]
     python scripts/panel_ctl.py restart  [--port 8791] [--json]
 
@@ -442,6 +443,63 @@ def act_start(port, no_browser=False, as_json=False, quiet=False,
     return 1
 
 
+def act_spawn(port, as_json=False, idle_exit=0.0, ttl=0.0, auto=False, wait=False):
+    """**只发起面板进程、不等待就绪**——供 hook 在严格时限内兜底拉起专用。
+
+    ⚠️ 为什么不复用 `start`：start 里是 `_wait_up(12s)` + `_detach_info`（PowerShell）
+     + `_code_build(20s)` + 状态查询，最坏 40s 以上；而 SessionStart（10s）与
+     UserPromptSubmit（15s）两个 hook 的时限都小于它 —— 兜底反而必然被「Hook timed out」
+     拦掉，面板一次也起不来（v1.0.40 实测复现：UserPromptSubmit 报 timeout 15000ms）。
+
+    逐项耗时实测（本机）：`_wmi_create` 11.9s、`_detach_info` 22.3s（两次 PowerShell
+    各 10s+）、`_code_build` 5.2s —— 光 PowerShell 就吃掉 40s。所以 spawn 里
+    **默认不查父进程**（`wait=False`），只做「幂等探测 → 会话外建进程 → 记 state」，
+    返回是 0.1s 级；`--wait` 才额外查一次（手动排查时用）。
+
+    注意：spawn 后**不保证**端口已就绪（WMI 建进程那一下就要 12s），
+    调用方要么异步不等（hook 快路径），要么自己再等几秒（`_wait_up`）。
+    """
+    if _probe(port, timeout=0.8):
+        info = {"status": "already-running", "port": int(port), "url": "http://127.0.0.1:%d/" % int(port)}
+        print(json.dumps(info, ensure_ascii=False) if as_json
+              else "面板已在运行（复用，未重复启动）：%s" % info["url"])
+        return 0
+    if not os.path.exists(PANEL):
+        print("找不到面板脚本：%s" % PANEL)
+        return 2
+    extra = []
+    eff_idle = float(idle_exit) if idle_exit else (AUTO_IDLE_EXIT if auto else 0.0)
+    if eff_idle:
+        extra += ["--idle-exit", str(eff_idle)]
+    if ttl:
+        extra += ["--ttl", str(float(ttl))]
+    how, ok = _spawn_detached(port, extra)
+    info = {"status": "spawned" if ok else "spawn-failed", "how": how,
+            "port": int(port), "panel_args": extra,
+            "url": "http://127.0.0.1:%d/" % int(port)}
+    if ok:
+        # ⚠️ 默认不查父进程：_detach_info 在实测里要 22.3s（两次 PowerShell 各 10s+），
+        #    挂在 hook 同步路径上就是必然超时。detached 用 `status` 命令事后查。
+        di = _detach_info(port) if wait else {}
+        info.update({"pid": di.get("pid") if wait else None,
+                     "detached": di.get("detached") if wait else None,
+                     "detach_why": di.get("why") if wait else None,
+                     "how_detail": how})
+        _save_state(port, {"how": how, "pid": di.get("pid"), "parent_pid": di.get("ppid"),
+                           "parent_name": di.get("parent"), "detached": di.get("detached"),
+                           "port": int(port), "extra": extra, "auto": bool(auto),
+                           "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    if as_json:
+        print(json.dumps(info, ensure_ascii=False))
+    else:
+        if ok:
+            print("已发起面板启动：%s（%s）→ %s"
+                  % (how, "会话外常驻" if info.get("detached") else "会话内，可能被回收", info["url"]))
+        else:
+            print("发起面板启动失败：WMI 与 Popen 均不可用，请手动 python %s start" % os.path.abspath(__file__))
+    return 0 if ok else 2
+
+
 def act_stop(port, as_json=False):
     pids = _pids_on(port) or _pids_on_fallback(port)
     if not pids:
@@ -545,8 +603,10 @@ def act_upgrade(port, no_browser=False, as_json=False, idle_exit=0.0, ttl=0.0, a
 def main():
     ap = argparse.ArgumentParser(description="任务执行进度·实时面板开关控制器")
     ap.add_argument("action",
-                    choices=["status", "start", "stop", "restart", "check", "upgrade"],
-                    help="check = 只回答「面板会不会拖住当前会话」；upgrade = 只在跑着旧版时才重启升级")
+                    choices=["status", "start", "spawn", "stop", "restart", "check", "upgrade"],
+                    help="spawn = 只发起不等待就绪（秒回，hook 兜底专用）；"
+                         "check = 只回答「面板会不会拖住当前会话」；"
+                         "upgrade = 只在跑着旧版时才重启升级")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true", help="启动时不自动打开浏览器")
     ap.add_argument("--json", action="store_true", help="机器可读输出")
@@ -556,6 +616,8 @@ def main():
     ap.add_argument("--auto", action="store_true",
                     help="自动化启动（hook）：默认带 --idle-exit %d，避免留下僵尸面板"
                          % int(AUTO_IDLE_EXIT))
+    ap.add_argument("--wait", action="store_true",
+                    help="spawn 后额外查一次父进程（多花 ~22s，仅手动排查用；hook 路径别加）")
     args = ap.parse_args()
 
     if args.action == "status":
@@ -565,6 +627,9 @@ def main():
     if args.action == "start":
         return act_start(args.port, args.no_browser, args.json,
                          idle_exit=args.idle_exit, ttl=args.ttl, auto=args.auto)
+    if args.action == "spawn":
+        return act_spawn(args.port, args.json, idle_exit=args.idle_exit,
+                         ttl=args.ttl, auto=args.auto)
     if args.action == "stop":
         return act_stop(args.port, args.json)
     if args.action == "upgrade":

@@ -59,8 +59,12 @@ def main():
                   or (isinstance(data.get("tool_input"), dict)
                       and data["tool_input"].get("session_id")) or "")
 
-    # 1) 立刻拉起面板服务（会话外常驻 + 空闲自退）
-    panel_up, _ = _ensure_panel(P.PANEL_PORT)
+    # 1) 立刻确保面板服务在线（兜底：万一开机自启 / 上次会话的兜底实例没着落）
+    #    ⚠️ 必须 quick=True（v1.0.40）：本 hook 的时限只有 15s，而完整拉起路径
+    #    （等 12s 就绪 + PowerShell 查父进程 + 跑 --build）最坏 40s+，
+    #    慢路径实测就是「UserPromptSubmit timeout 15000ms」把整条 hook 拦掉。
+    #    quick 版秒回且不因启动慢而失败——面板起不来也得让这条命令正常执行。
+    panel_up, panel_note = _ensure_panel(P.PANEL_PORT, quick=True)
 
     # 2) 建/续一张「用户请求」会话卡：received_at = 接到命令的时刻
     #    job_id 用 sess-<session_id>，同一会话始终复用同一张卡。
@@ -69,6 +73,9 @@ def main():
     #    （实测出现「接到命令 08:45、已运行 10h15m」）。步骤列表同步清空，
     #    本回合的工具动作由 hook_bg 重新映射进来。
     notes = []
+    # 兜底拉起的结果（"已后台发起"/"端口还没通"…）只进 stderr，便于排查，不影响会话
+    if panel_note:
+        notes.append(panel_note)
     if prompt:
         jid = "sess-" + (session_id or "default")
         # v1.0.38：prompt 里混着 WB 注入的 XML（<task-notification>…</task-notification> 等），

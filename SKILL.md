@@ -7,7 +7,7 @@ slug: xueren-workbuddy-live-progress
 displayName: 雪人老师·[WorkBuddy]任务执行进度·实时面板
 summary: 完整任务执行过程（前台+后台）实时看板：从接到命令→执行中→结束，时间线/步骤进度条/进度环/速率/ETA/日志；前台任务每个工具调用默认自动映射成步骤，无需手动接入。
 description_en: A universal live progress panel for background tasks in a session.
-version: 1.0.39
+version: 1.0.51
 author: 雪人
 license: MIT
 allowed-tools: ""
@@ -46,7 +46,23 @@ description_zh: WorkBuddy 会话任务通用「任务执行进度·实时面板�
 > 🔴 **收尾契约（v1.0.33 建立，v1.0.36 提速）**：会话卡收尾以 **WB 权威会话状态**为准——面板采样循环每 1 秒读 `~/.workbuddy/workbuddy.db` 的 `sessions.status`（WB 界面同源）自动对表（`sync_wb_sessions` 内部 1s 限流）：`working`（执行中）→ 保持运行中；`completed/archived/已删除` → done；`error` → failed；`terminated` → aborted，**≤2 秒跟上**；前端轮询同为 1 秒。你**无需**手动 `finish-session`，也不会出现「没结束却显示结束」或「结束了还挂 running」。兜底：后台卡（`bg-*`）由 `hook_bg` 在最后一个后台任务完成时级联收（漏读输出时用 `finish --id bg-xxx`）；脚本自建卡由 `with Progress` 退出自动收；db 查不到的会话 / 异常中断（崩溃、关窗口）由 `SessionEnd` 与「30 分钟无更新」gc 收为 aborted。
 > ⚠️ **唯一不能省的**：本轮若有**后台任务仍在跑**，结束前必须 `present_files` 打开面板（Stop hook 会 exit 2 拦截提醒）。
 
-> ⚠️ 服务是**内存态**：重启机器、WB 重启或 `stop` / 空闲 30 分钟后服务会消失（页面变空白）。但**下次会话启动 / 提交命令 / 起后台任务时 hook 会自动把它拉起来**，无需手动；也可手动 `panel_ctl.py start` 或双击 `start_panel.bat`。会话 job 只回收代理自己 spawn 的后代进程，故启动一律走 WMI；待办/历史数据（`~/.workbuddy/live-progress/jobs.json`）与进程无关，重启后照样可见。
+> ⚠️ 服务是**内存态**：WB 重启或 `stop` / 空闲 30 分钟后服务会消失（页面变空白）。但**下次会话启动 / 提交命令 / 起后台任务时 hook 会自动把它拉起来**，无需手动；也可手动 `panel_ctl.py start` 或双击 `start_panel.bat`。会话 job 只回收代理自己 spawn 的后代进程，故启动一律走 WMI；待办/历史数据（`~/.workbuddy/live-progress/jobs.json`）与进程无关，重启后照样可见。
+
+## 开机 / 登录自启（v1.0.41）
+
+想让面板「开机即常驻、首条命令零冷启动」，装下面两条通道（都幂等，重复跑无害）：
+
+| 通道 | 装法 | 谁触发 |
+|---|---|---|
+| 启动文件夹 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\LiveProgressPanel.bat`（默认已装） | explorer 登录后 |
+| 计划任务 | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_panel_boot_task.ps1`（注册 AtLogOn；非管理员可能被 `0x80070005 拒绝访问` 拒掉，换「以管理员身份运行」的 PowerShell 重跑即可） | 用户登录 |
+
+- 🔴 **启动器一律用 `pythonw.exe`，不是 `python.exe`**：`python.exe` 自带控制台窗口，登录时会弹一个 cmd 窗口（即使加了 `/MIN` 也只是一个最小化窗口，桌面照样脏）；`pythonw.exe` 根本没有控制台。计划任务的 Action 也**直接指向 `pythonw.exe`**，中间不要套 `powershell -File xxx.ps1`。
+- **面板不等 WorkBuddy**：签到脚本必须等 WB 进程起来（AtRest 加密登录态要用客户端内存密钥，最多等 180s），面板只是本地 http + 读 `workbuddy.db` 磁盘文件 → 登录瞬间就绪，实测 **1 秒内**起来、`父进程 WmiPrvSE.exe`（会话外常驻）、窗口列表**零残留**。
+- **收益就是干掉 hook 超时**：开机常驻后 `hook_session` / `hook_prompt` 走快路径（已在跑 → 0.x 秒返回），不再撞 `Hook timed out after 15000ms`；万一真没起来它们仍会兜底拉起（`--auto`，空闲 30 分钟自退）。两种策略是自洽的：`hook_bg._persist_desired()` 检测到 Startup bat 存在 → 兜底实例也常驻，不会「开机常驻、hook 反而 30 分钟自退」打架。
+- 关掉自启：删掉 Startup 里的 bat，再跑 `scripts/uninstall_panel_boot_task.ps1`。
+- 排查用日志 `~/.workbuddy/scripts/panel_boot.log`（每次登录后一行时间戳）；`panel_ctl.py status` 看运行实例与父进程。
+- ⚠️ 查计划任务别用 `Get-ScheduledTask -TaskName`（只搜根路径），用户级任务在 `\<用户名>\` 下，用 `Get-ScheduledTask | ?{ $_.TaskName -like "*Panel*" }` 全量列。
 
 ## 你的工作方式
 
@@ -96,6 +112,8 @@ python scripts/progress.py list --running   # 验收：本轮是否还有卡在�
 ## 配置与参数
 
 - 注册表 `~/.workbuddy/live-progress/jobs.json`（`LIVE_PROGRESS_DIR` 覆盖）；端口 8791（`LIVE_PROGRESS_PORT` 覆盖）；上限 40 条（按 `updated_at` 保留最新）。
+- **每个任务保留的日志行数默认 40**（`progress.py` 的 `MAX_LOG`）：写满后**直接丢弃旧行**，所以长会话的早期日志不会留在注册表里 —— 卡片上「日志 N 行」到 40 就封顶。
+  要留住更多历史：`LIVE_PROGRESS_MAX_LOG=300`（环境变量，取不到值即回退 40）。⚠️ 面板日志区**只渲染最后 10 行**（定高滚动框），放大上限并不会让可见行数变多。
 - hooks 安装 `python scripts/install_hooks.py`（幂等、自动备份 settings.json；`--status` / `--uninstall`）。
 - **改代码即生效**：面板热更新——`live_panel.py` / `progress.py` 一改，运行中的面板 3 秒内用同参数重启（前端 build 变了自动 reload），通常无需手动 restart；自动重启失败（端口被占）时 `panel_ctl.py upgrade` → `restart` → 换端口三选一。
 - `panel_ctl.py status` 给出「运行中 build / 磁盘 build」，不一致即改动未生效；热更新没成功时 hook 也会把提醒带进会话上下文。
@@ -109,22 +127,35 @@ python scripts/progress.py list --running   # 验收：本轮是否还有卡在�
 | 通道 | 命令 |
 |---|---|
 | GitHub | `publish_skill.py --skill xueren-workbuddy-live-progress --user <your-github-user> --token <PAT>`（建仓库 + 推 + 自动 Release `v<version>`） |
-| SkillHub | `publish_skillhub.py --skill xueren-workbuddy-live-progress --exclude "assets/*.png" --changelog "…"`（**拒收 png**，必须 `--exclude`） |
+| SkillHub | `publish_skillhub.py --skill xueren-workbuddy-live-progress --exclude "assets/*.png" --changelog "…"`（**拒收 png**，必须 `--exclude`；png 只服务 GitHub 仓库与本地，SkillHub 包内不插图） |
 | 自更新 | `python scripts/check_update.py [--auto]`（查 GitHub / SkillHub 最新版，`--auto` 自动更新） |
 
 `check_update.py`：`--auto --json`（结构化，供定时任务）/ `--force`（强制跑一遍）/ `--source skillhub|github|both` / `--backups`。零凭据（GitHub 匿名 API + SkillHub 公开接口），仓库坐标自 `github:`、SkillHub 标识自 `slug:` 解析；链路＝下载 → 包校验（须含 `SKILL.md` + `live_panel.py` + `progress.py`）→ 备份 `cache/backups/` → 同步（`cache/`、`.git` 不覆盖）→ 冒烟（`py_compile` + 版本核对 + 面板 200）→ 失败自动回滚。改完不用手动重启面板（热更新生效，hooks 也不用重装）。SkillHub 索引有延迟，刚发的版本搜不到属正常。
 
 定时检测（每天 09:30）：`python ~/.workbuddy/skills/xueren-workbuddy-live-progress/scripts/check_update.py --auto --json`。
 
+**文档插图一律用外链 URL**（v1.0.49 起 `README.md` 已改）：SkillHub 拒收 png，包内插图在 SkillHub 详情页必然裂，所以配图走 **GitHub raw 外链**
+（`https://raw.githubusercontent.com/JackieZheng/xueren-workbuddy-live-progress/main/assets/panel_preview.png`）。
+已验证 **SkillHub 与 GitHub 都支持外链图片**（SkillHub 详情页渲染的是 `SKILL.md` 正文、外链图直连加载成功），且**插图必须放正文段落级**（写在列表项里的 `![]()` 不会被渲染，会原样残留 markdown 原文）。
+发布时 `--exclude "assets/*.png"` 照旧：png 只留在 GitHub 仓库与本地，不进 SkillHub 用户包。
+
+**改过 `check_update.py` 后**：跑 `scripts/_test_check_update.py` 做离线自检（不联网、不碰真实目录，三层场景：正常更新 / 坏包回滚 / 零污染；跑法见 `docs/update-test.md`——该手册属开发内容，**不随 SkillHub / GitHub 发布物外发**，只在本地仓库与备份库里）。⚠️ 别用「跑一次 `--auto` 看结果」验收 —— 本地版本通常领先远端，只会走 `up-to-date` 快路径，更新链路一次都执行不到。
+
 ## 文件清单
 
 - 根目录：`start_panel.bat`（双击启动）/ `stop_panel.bat`（双击停止）
+- 开机自启（落到 `~/.workbuddy/scripts/`，**纯 ASCII/英文注释**）：`install_panel_boot_task.ps1`（注册 AtLogOn 计划任务）、`uninstall_panel_boot_task.ps1`（注销）、启动文件夹 `LiveProgressPanel.bat`（登录时由 explorer 拉起，**用 pythonw.exe 无窗口**）
 - `scripts/progress.py`：登记库 + CLI（唯一写方，原子写 + 跨进程锁）
 - `scripts/live_panel.py`：面板服务 8791，只读注册表 + `--idle-exit` / `--ttl` 看门狗
 - `scripts/panel_ctl.py`：开关控制器（严格探活 / WMI 会话外启动 / 脱离会话校验）
 - `scripts/progress_bridge.py`：状态文件桥接（轮询上报 + 停更收尾 + settle）
 - hooks：`hook_bg.py`（后台登记 + 自动拉面板 + 完成回填）、`hook_prompt.py`（建会话卡 + 回合提醒，20 秒限频桶）、`hook_auto_step.py`（工具调用自动成步骤）、`hook_stop.py`（Stop 强制开面板 / SessionEnd 收）、`hook_session.py`（**会话启动即拉起面板** + 收异常中断卡 + 注入约定）、`install_hooks.py`（各事件 matcher 全用 `*`，覆盖 WB 重启后的会话恢复）
-- `scripts/check_update.py`：版本自更新；`_demo_jobs.py` / `_test_hook.py`（演示与自测，可删）
+- `scripts/check_update.py`：版本自更新；`_test_check_update.py`（自更新离线自测，`docs/update-test.md`）、`_test_logcount.py`（日志累计行数单调性离线自测）；`_demo_jobs.py` / `_probe_marquee.py` / `_test_hook.py`（演示与自测，可删）
+- `docs/update-test.md`：自更新链路自检手册（开发用，**AI 工作流程不看这里**；**开发内容，两个发布渠道都不外发**）
+- `docs/DEVLOG.md`：版本演进与踩坑记录（开发级，**AI 工作流程不看这里**；两个发布渠道都不外发）
+- **文档分级铁律（2026-10-03 用户定策）**：`SKILL.md`（给 AI 的流程）+ `README.md`（给用户的功能介绍）= **产品级**，SkillHub 与 GitHub Release 都带；
+  `docs/**`（DEVLOG、排障手册等）+ `_test_` / `_probe_` / `_demo_` 开头脚本 = **开发级**，**两个渠道一律不外发、也不搬去根目录**。
+  新增开发文档一律直接落 `docs/`，别再往根目录丢。
 - `assets/panel_preview.png`：横屏效果图（README 用）
 
 ## 注意事项

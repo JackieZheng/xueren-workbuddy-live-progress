@@ -3,9 +3,10 @@
 > WorkBuddy 会话任务通用「任务执行进度 · 实时面板」——用 hook 自动把工具调用映射成步骤，
 > 打开一个浏览器页面即可实时看到每个任务跑到哪一步、还剩多少、卡在哪儿。
 
-![面板效果](assets/panel_preview.png)
+![面板效果](https://raw.githubusercontent.com/JackieZheng/xueren-workbuddy-live-progress/main/assets/panel_preview.png)
 
-（图为 v1.0.27 在 1440px 横屏视口下的实拍：左侧三张并行任务卡，各卡片严格等高；底部常驻 CPU / 内存状态栏。）
+（图为 v1.0.27 在 1440px 横屏视口下的实拍：左侧三张并行任务卡，各卡片严格等高；底部常驻 CPU / 内存状态栏。
+图片走 GitHub raw 外链，SkillHub / GitHub 详情页都能直出，不受包内二进制文件限制。）
 
 ---
 
@@ -143,7 +144,6 @@ P.finish("批量下载素材包", ok=True, message="全部完成")
 xueren-workbuddy-live-progress/
 ├── SKILL.md                  # skill 定义（16 字段 frontmatter + 7 章节）
 ├── README.md
-├── DEVLOG.md                 # 版本演进与踩坑记录
 ├── assets/
 │   └── panel_preview.png     # 面板效果图
 ├── scripts/
@@ -159,8 +159,15 @@ xueren-workbuddy-live-progress/
 │   ├── check_update.py       # 版本自更新（查 GitHub/SkillHub → 下载 → 备份 → 同步 → 冒烟 → 回滚）
 │   └── _panel_relaunch.py    # 热更新接力进程（Windows 下平滑换进程）
 ├── start_panel.bat / stop_panel.bat
-└── cache/                    # 运行期截图等临时产物（不入库）
+├── cache/                    # 运行期截图等临时产物（不入库）
+└── docs/                     # 开发级文档（不外发，见下）
+    ├── DEVLOG.md             # 版本演进与踩坑记录
+    └── update-test.md        # 自更新链路自检手册
 ```
+
+> **文档分级（产品口径）**：`SKILL.md` / `README.md` 面向用户与 AI，两个发布渠道都带；
+> `docs/` 与 `DEVLOG.md` 属开发级（测试 / 排障 / 版本日志），**两个渠道都不外发**；
+> `scripts/` 下 `_test_` / `_probe_` / `_demo_` 开头的脚本同理。
 
 ## 自动更新
 

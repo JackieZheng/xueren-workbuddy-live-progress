@@ -125,7 +125,27 @@ def _code_fingerprint():
         return None
 
 
+def _meta_fingerprint():
+    """SKILL.md frontmatter 指纹（v1.0.42）。
+
+    🔴 为什么必须有它（v1.0.41 踩的坑）：标题版本 `SKILL_VERSION` 是**模块级常量**，
+    进程启动时把 frontmatter 的 `version` 读一次就焊死；而热更新 `_code_fingerprint()`
+    只哈希 live_panel.py + progress.py —— **光改 SKILL.md 版本号，热更新毫无感知**，
+    页面会一直挂着旧版（表现为「磁盘改了、线上没变」）。故把 frontmatter 也纳入探测。
+    """
+    try:
+        with open(os.path.join(SKILL_DIR, "SKILL.md"), encoding="utf-8") as f:
+            txt = f.read()
+        fm = txt.split("\n---", 1)[0] if txt.startswith("---") else txt[:4000]
+        h = hashlib.md5()
+        h.update(fm.strip().encode("utf-8"))
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 CODE_FP = [_code_fingerprint()]     # 启动时记一份，用于比对
+META_FP = [_meta_fingerprint()]     # SKILL.md frontmatter 指纹（含 version / name）
 SRV = [None]                        # 服务器对象（热更新前要先关监听套接字）
 LAST_FP_CHECK = [0.0]
 
@@ -143,10 +163,25 @@ def hot_reload_if_changed(force_check=False):
     try:
         fp = _code_fingerprint()
     except Exception:
+        fp = None
+    try:
+        mfp = _meta_fingerprint()
+    except Exception:
+        mfp = None
+    # 两类变更：① .py 代码变了；② SKILL.md frontmatter（版本号/名称）变了
+    code_changed = bool(fp) and fp != CODE_FP[0]
+    meta_changed = bool(mfp) and mfp != META_FP[0]
+    if not code_changed and not meta_changed:
         return False
-    if not fp or fp == CODE_FP[0]:
-        return False
-    print("[hot-reload] 检测到代码变更 → 自动重启面板进程加载新代码", flush=True)
+    # 先把指纹往前推：万一下面重启失败，别让旧进程陷入「一直以为自己过期」的死循环
+    if code_changed and fp is not None:
+        CODE_FP[0] = fp
+    if meta_changed and mfp is not None:
+        META_FP[0] = mfp
+    print("[hot-reload] 检测到%s → 自动重启面板进程加载新%s" % (
+        "SKILL.md 元数据/版本变更" if meta_changed and not code_changed
+        else ("代码变更 + SKILL.md 元数据变更" if meta_changed else "代码变更"),
+        "版本" if meta_changed and not code_changed else "代码"), flush=True)
     try:
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "_panel_relaunch.py")
@@ -327,10 +362,20 @@ def job_payload(j, now):
     _tail_from_file = _tail_file(_log_file)
     if _tail_from_file:
         log_tail = _tail_from_file
+        # 有外部日志文件时以文件真实行数为准（log_total 只统计写进注册表 log 的行）
         log_count = _count_file_lines(_log_file) or len(_tail_from_file)
+        log_all = log_count
     else:
         log_tail = _log_arr[-10:]
-        log_count = len(_log_arr)
+        # log_total = progress.py 维护的**累计**日志行数（跨回合），不受 MAX_LOG 截断影响。
+        # 旧卡没有该字段时退化成当前保留行数（写满后会停在 MAX_LOG，属历史行为）。
+        _tot = j.get("log_total")
+        log_all = int(_tot) if isinstance(_tot, (int, float)) and _tot > 0 else len(_log_arr)
+        # v1.0.51：指标格显示的是**当前任务/本回合**行数 log_round
+        # （progress.py 在用户新提交命令时把它归零），不是把整个会话其它任务的行数
+        # 都累进去的 log_total。两者不等时前端 tooltip 里给出「本轮 N 行 · 累计 M 行」。
+        _rnd = j.get("log_round")
+        log_count = int(_rnd) if isinstance(_rnd, (int, float)) and _rnd >= 0 else log_all
     # 无总量且有时间基线 → 用**真实时间戳**折算进度曲线（否则 done 恒定，曲线是一条死线）
     if (not total) and running_like and planned and len(arr) >= 2:
         arr = [[t, round(min(99.0, max(0.0, (t - started) / planned * 100)))] for t, _ in arr]
@@ -360,7 +405,8 @@ def job_payload(j, now):
         "cwd": (j.get("cwd") or "").replace("\\", "/").split("/")[-1],
         "session": (j.get("session_id") or "")[:6],
         "log_tail": log_tail[-10:],
-        "log_count": log_count,      # 真实日志行数（不是 log_tail 的 10 行切片）
+        "log_count": log_count,      # 真实日志行数（不是 log_tail 的 10 行切片）= 当前任务/本回合
+        "log_all": log_all,          # 本卡累计行数（跨回合），仅 tooltip 参考
         "samples": [{"t": int(t), "d": d} for t, d in arr[-120:]],
         "started_ts": started,
         "received_ts": j.get("received_at") or started,
@@ -712,7 +758,7 @@ body{padding-top:clamp(84px,15vw,104px);padding-bottom:clamp(46px,7vw,58px)}
 代理在接到用户命令时会立即建卡并展开本看板；任何脚本也能一行接入：<code>from progress import Progress</code> → <code>with Progress("任务名", total=100) as p: p.set(done)</code><br>
 命令行接入：<code>python progress.py begin --title "任务名" --total 100 --steps "准备,处理,收尾"</code>
 </div>
-<details class="fold" id="fold" style="display:none">
+<details class="fold" id="fold">
 <summary><span class="arrow">▶</span><span id="foldtxt">已结束的任务</span><button class="clearbtn" id="clearfin" type="button" title="清空全部已结束记录（运行中的任务不受影响）">清空已结束</button></summary>
 <div class="grid foldgrid" id="foldgrid"></div>
 </details>
@@ -998,6 +1044,14 @@ function renderCard(c,d){
   if(r.stats.dataset.n!=='4'){ r.stats.innerHTML=m.map(()=>'<div class="stat"><div class="k"></div><div class="v"></div></div>').join(''); r.stats.dataset.n='4'; }
   const boxes=r.stats.children;
   for(let i=0;i<m.length;i++){ boxes[i].querySelector('.k').textContent=m[i][0]; boxes[i].querySelector('.v').textContent=m[i][1]; }
+  // 日志格（恒为第 4 格）挂完整口径：显示值是「当前任务/本回合」行数，累计值另说
+  // （会话卡跨回合复用，两者差很多；不解释清楚用户会以为数字把别的任务也算进去了）
+  if(boxes.length>3){
+    const lc=(d.log_all==null?null:d.log_all), ln=(d.log_count==null?0:d.log_count);
+    boxes[3].title=(lc!=null&&lc!==ln)
+      ? ('日志：当前任务 '+ln+' 行 · 本卡累计 '+lc+' 行')
+      : ('日志：当前任务 '+ln+' 行');
+  }
   layoutStats(r.stats);
   // 曲线（无样本就整段隐去，避免空壳）
   // ⚠️ 踩坑：早期这里写 r.dots.parentNode.querySelector('.t') —— parentNode 是整张卡片，
@@ -1141,7 +1195,10 @@ function placeCard(d, parent, mini, seen){
   c.el.classList.toggle('mini', !!mini);
   renderCard(c,d);
 }
-function foldLabel(n, open){ return '已结束的任务 '+n+'（点击'+(open?'收起':'展开')+'）'; }
+function foldLabel(n, open){
+  if(!n) return '已结束的任务 0（暂无已结束的记录）';
+  return '已结束的任务 '+n+'（点击'+(open?'收起':'展开')+'）';
+}
 function render(p){
   if(!p) return;
   // 固定头栏里这行也必须单行（否则会把头栏撑成两行、高度抖动）→ 超长走马灯
@@ -1177,8 +1234,13 @@ function render(p){
       if(cur!==list[i]) parent.insertBefore(list[i], cur||null);
     }
   });
-  fold.style.display=fin.length?'block':'none';
+  // v1.0.51：折叠区**常驻可见**（哪怕 fin=0 也露出「已结束的任务 0（暂无记录）」那条头）。
+  // 之前 0 条时整块 display:none，用户反馈「已完成任务面板没了」——实际上是收了看不见，
+  // 不是没了。卡片可以收在折叠里，但这条入口必须在（一眼看到有几条、点开即看）。
+  fold.style.display='block';
   document.getElementById('foldtxt').textContent=foldLabel(fin.length, fold.open);
+  const clrBtn=document.getElementById('clearfin');
+  if(clrBtn) clrBtn.style.display=fin.length?'':'none';   // 0 条时别给个点了没反应的按钮
   Object.keys(CARDS).forEach(id=>{ if(!seen[id]){ CARDS[id].el.remove(); delete CARDS[id]; delete LAST[id]; delete DATA[id]; } });
 }
 /* 顶部/底部固定栏都是 position:fixed，正文必须留出等高 padding，否则首尾卡片会被压住。

@@ -172,9 +172,77 @@ def _stale_panel(port):
     return (run, code) if (run and code and run != code) else (None, None)
 
 
-def _ensure_panel(port):
-    """确保面板服务在线；返回 (alive, note)。不在跑就自动拉起（会话外常驻）。"""
+# 开机自启脚本（Startup 启动文件夹）。它的存在 = 用户要「登录即常驻」，
+# hook 兜底拉起时应**与自启策略一致**（常驻，不带 --auto），否则两套策略打架：
+# 自启是常驻、兜底 30 分钟自退，用户永远觉得「面板怎么又自己停了」。
+_STARTUP_BAT = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "Microsoft",
+                            "Windows", "Start Menu", "Programs", "Startup",
+                            "LiveProgressPanel.bat")
+
+
+def _persist_desired():
+    """用户是否配置了「开机/登录自启」面板 → 是则兜底实例也常驻。"""
+    try:
+        return os.path.exists(_STARTUP_BAT)
+    except Exception:
+        return False
+
+
+def _launch_panel_background(port, persist=True, timeout=4.0):
+    """**发起即返回**：把 `panel_ctl spawn` 丢到后台跑，hook 不等它建完进程。
+
+    为什么必须异步：`panel_ctl spawn` 内部走 WMI 建进程，实测 11.9s（PowerShell 冷启动）；
+    若 hook 同步 `subprocess.run` 等它，UserPromptSubmit 那条 15s 的 hook 直接被
+    「timeout」拦掉 —— 兜底不但没帮上忙，还把整条命令的执行流程顶断了。
+    这里先试脱离式 Popen（0.1s 返回），被环境策略拒绝时再降级为同步 spawn 并卡死在
+    timeout 秒内，保证 **hook 一定能按时退出**。
+
+    ⚠️ timeout 默认只给 4s：脱离式 Popen 可用时是 0.1s 返回；只有在**连 Popen 都被
+    环境策略拒绝**（实测沙箱里 PermissionError WinError 5）时才退化成同步 WMI
+    （要 11.9s），这时必须提前掐断——否则 10s 的 SessionStart 必然被拦。
+
+    面板真正起来还要几秒（WMI 建进程 + Python 启动），由调用方等端口，或下一条命令重试。
+    """
+    cmd = [sys.executable, PANEL_CTL, "spawn", "--port", str(int(port)), "--no-browser", "--json"]
+    if not persist:                       # 没配开机自启 → 空闲自退，不留永久僵尸
+        cmd += ["--auto"]
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200 | 0x01000000   # DETACHED | NEW_PROCESS_GROUP | BREAKAWAY
+        try:
+            subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return True, "已后台发起面板启动（detached Popen）"
+        except Exception:
+            pass
+    # ⚠️ 降级路径**必须**用 DEVNULL 而不是 capture_output：捕获会建一条匿名管道，
+    # 而 WMI 建出来的孙进程（面板）会继承它的写端（PowerShell → panel_ctl → 管道），
+    # 结果是 panel_ctl 被 timeout 杀掉后 `communicate()` 还死等 EOF，白白多耗 4~8s，
+    # 10s 的 SessionStart 就这么被吃掉了。DEVNULL 没有管道，kill 完立刻返回。
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+        return True, "已发起面板启动（同步 spawn，rc=%s）" % r.returncode
+    except Exception:
+        return False, "面板启动发起失败"
+
+
+def _ensure_panel(port, quick=False, wait_up=3.0):
+    """确保面板服务在线；返回 (alive, note)。不在跑就自动拉起（会话外常驻）。
+
+    **quick=True（v1.0.40）**：给 SessionStart（10s）/ UserPromptSubmit（15s）这类
+    **时限极紧且「拉不起来也必须放行」** 的 hook 用。三点不同：
+      ① 面板已在跑时**跳过 stale 检查**——那条要 spawn 一个 subprocess 跑 `--build`
+         拿磁盘指纹，最坏 15s，光它就能把 hook 顶超时；
+      ② 拉起改用 `panel_ctl spawn`（秒回），不再调 `start`（内部要等 12s 就绪 +
+         PowerShell 查父进程 + 20s 算 build，最坏 40s）；
+      ③ **无论成败都返回 True**：兜底最忌讳「启动慢 → hook 超时 → 整条 hook 被拦」，
+         那样面板反而一次都起不来。起不来就落到 note 里，下一条命令会再试一次。
+    quick=False：hook_bg（PostToolUse，15s，需要 detached 状态做告警）走原路径。
+    """
     if _panel_ok(port):
+        if quick:
+            return True, None
         run, code = _stale_panel(port)
         if run:
             return True, ("⚠️ 端口 %d 上跑的是**旧版面板**（运行中 build=%s，磁盘代码 build=%s）——"
@@ -187,12 +255,28 @@ def _ensure_panel(port):
         return False, ("端口 %d 被非面板程序占用：请改用 panel_ctl.py start --port 8792" % port)
     if not _start_guard_ok():
         return False, "面板启动刚失败过，60 秒内不再重试"
+
+    persist = _persist_desired()
+
+    if quick:
+        # 快路径：发起（不等）→ 最多等 5 秒看端口通不通 → 通了就报成功，
+        # 没通也**不熔断、不返回 False**，让下一条命令再兜一次。
+        launched, why = _launch_panel_background(port, persist=persist)
+        # 再等 wait_up 秒看端口通不通（SessionStart 传 0 = 只发起不等，
+        # 最坏 0.5 探测 + 3 发起 = 3.5s，稳过 10s；UserPromptSubmit 给 3s 兜体验）
+        t0 = time.time()
+        while time.time() - t0 < wait_up:
+            if _panel_ok(port, timeout=0.8):
+                break
+            time.sleep(0.3)
+        if _panel_ok(port, timeout=0.8):
+            return True, ("面板服务已自动启动（会话外%s）"
+                          % ("常驻" if persist else "空闲自退"))
+        return True, ("%s；面板约需 10 秒就绪，当前端口还没通，下一条命令会自动再兜一次"
+                      "（仍不可用请跑 python %s status）" % (why or "已发起启动", PANEL_CTL))
+
     try:
         exe = sys.executable
-        pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if not os.path.exists(pw):
-            pw = exe
-        # --auto：自动拉起的实例带空闲自退，绝不留下"永远不退出的面板拖住会话"
         r = subprocess.run([exe, PANEL_CTL, "start", "--port", str(int(port)),
                             "--no-browser", "--auto", "--json"],
                            capture_output=True, timeout=40)

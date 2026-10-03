@@ -45,7 +45,86 @@ JOBS = os.path.join(ROOT, "jobs.json")
 LOCK = os.path.join(ROOT, "jobs.lock")
 PANEL_PORT = int(os.environ.get("LIVE_PROGRESS_PORT") or 8791)
 MAX_JOBS = 40          # 注册表最多保留条数（按更新时间）
-MAX_LOG = 40           # 每个任务保留的日志行数
+# 每个任务保留的日志行数（旧日志写满即丢弃旧行 —— 不是环形缓冲，是对外可见的全部历史）。
+# 默认 40：jobs.json 体积与面板轮询开销的平衡。要留住长会话的早期日志，用环境变量放大：
+#   LIVE_PROGRESS_MAX_LOG=300 python progress.py ...   （或在面板同环境里 export 后启动）
+MAX_LOG = int(os.environ.get("LIVE_PROGRESS_MAX_LOG") or 40)
+
+
+def _log_trim(seq):
+    """把日志序列裁到最近 MAX_LOG 行（就地）。"""
+    del seq[:-MAX_LOG]
+    return seq
+
+
+def _log_total(j, n_lines, base=None):
+    """追加了 n_lines 行日志后，计算任务的**累计**日志行数 log_total。
+
+    背景（2026-10-03 用户实测反馈）：jobs.json 里的 log 列表被 MAX_LOG 截断，
+    面板指标格「日志 N 行」原本直接取 len(log)，一旦写满 40 行就永远显示 40-
+    明明显下面的日志在涨、数字却不动。这里另存一个**不受截断影响**的累计计数器
+    log_total（写在 jobs.json 里），面板优先读它。
+
+    基数是「旧计数」与「当前保留行数」的 max：既能接住老任务（迁移前只有
+    len(log)），也保证计数只增不倒退。老任务的绝对基数可能偏低（截断时已丢的行
+    数没被算进去），但从这一刻起严格正确、且逐行递增。
+    """
+    prev = j.get("log_total")
+    if prev is None and base is None:
+        base = len(j.get("log") or [])
+    j["log_total"] = (int(prev) if isinstance(prev, (int, float)) else int(base or 0)) \
+        + int(n_lines)
+    return j["log_total"]
+
+
+def _log_round_add(j, n_lines, base=None):
+    """维护 **当前任务/本回合** 日志行数 log_round（面板指标格显示的那个「日志 N 行」）。
+
+    口径来自用户 2026-10-03 的反馈：「日志计数器为当前任务的日志行数，
+    不要累积其它任务的日志行」。会话卡是同一张卡跨多个回合复用，
+    若显示 log_total（全会话累计），用户看到的就是 233 行这种"把本会话每条
+    命令/每个任务的日志都算进来"的数——不符合"当前任务"的直觉。
+    所以拆两个计数器：
+      log_total = 本卡**累计**（跨回合），退出面指标格显示，只作累计参考；
+      log_round = **当前任务/本回合** 新增行数，round_reset（新用户命令）时归零。
+    """
+    prev = j.get("log_round")
+    if prev is None and base is None:
+        base = len(j.get("log") or [])
+    if not isinstance(prev, (int, float)):
+        prev = None
+    else:
+        # 自愈：上一版双基准不一致时写入过「本轮 > 累计」的脏值（实测 106/105），
+        # 这里收敛回累计值，**本轮 ≤ 累计** 必须恒成立，否则指标格 tooltip 会自相矛盾。
+        tot = j.get("log_total")
+        if isinstance(tot, (int, float)) and int(prev) > int(tot):
+            prev = int(tot)
+            j["log_round"] = prev            # 就地归一化，避免每次 push 都靠 clamp
+            return prev + int(n_lines)
+    j["log_round"] = (int(prev) if prev is not None else int(base or 0)) + int(n_lines)
+    return j["log_round"]
+
+
+def _log_push(j, lines):
+    """追加日志行 + 维护两个计数（唯一入口，别再手写 log.append）。
+
+    ⚠️ 两个计数器的迁移基准必须是**同一份**「追加前的保留行数」：早期实现先算 log_total
+    再算 log_round，各自在方法内部现取 len(log)（此时已 append 过），于是旧卡迁移后
+    出现「本轮 54 行 / 累计 53 行」——看着像账算错了。这里统一用追加前的长度。
+    """
+    seq = _log_trim(list(j.get("log") or []) + list(lines))
+    j["log"] = seq
+    n = len(lines)
+    base = max(0, len(seq) - n)
+    _log_total(j, n, base)
+    _log_round_add(j, n, base)
+    # 不变量「本轮 ≤ 累计」：老卡里可能残留「本轮 > 累计」的脏值（v1.0.51 中途版本
+    # 两个计数器基准不一致写进去的），每次 push 都收敛一次，最多一拍就自愈。
+    if int(j.get("log_round") or 0) > int(j.get("log_total") or 0):
+        j["log_round"] = int(j["log_total"])
+    return j
+
+
 STALE_AFTER = 900      # 秒：running 任务多久无更新视为"疑似已结束"
 GC_ABANDON_AFTER = 1800  # 秒：会话卡 30 分钟无更新 → 判定「异常中断」，兜底收尾（只动 sess-*）
 
@@ -270,10 +349,26 @@ def register(title, total=None, unit="项", job_id=None, source="script",
         # 日志基线：保留旧日志；本次若显式接入步骤，补一行「接入 N 步」——让「只上报步骤、
         # 不单独写日志」的任务（如定时任务 begin --steps）也能在日志区看到东西（不再是 0 行）。
         base_log = list(old.get("log") or [])
+        # 累计日志行数基线：优先沿用旧计数（register 会重建 dict，必须显式保留），
+        # 老任务没有这个字段时退化成当前保留行数，保证不计入后面重复累加。
+        base_total = int(old.get("log_total") or len(base_log) or 0)
+        # 当前任务/本回合的日志行数：round_reset（用户新提交一条命令 = 新一轮）
+        # 时归零——面板指标格显示的「日志 N 行」就是从这个基准往上数。
+        # ⚠️ 迁移基准必须 ≤ base_total：老卡没有 log_round 字段时，log_total 与
+        # len(base_log) 可能已经不齐（截断/重写过），直接拿 len 做本轮基准会让
+        # 「本轮行数」反超「累计行数」（实测 88 vs 87，看着像账算错）。
+        base_round = 0 if round_reset else (
+            int(old["log_round"]) if isinstance(old.get("log_round"), (int, float))
+            else min(base_total, len(base_log)))
+        base_round = min(base_round, base_total)   # 不变量：本轮 ≤ 累计
         if norm_steps and steps is not None:
             base_log.append("%s  接入 %d 步：%s" % (time.strftime("%H:%M:%S"),
                                                   len(norm_steps), " / ".join(norm_steps[:8])))
-            del base_log[:-MAX_LOG]
+            base_log = _log_trim(base_log)
+            base_total += 1
+            base_round += 1       # 「接入 N 步」这一行两个计数器都要算（否则本轮会比累计多 1）
+        else:
+            base_log = _log_trim(base_log)
         jobs[jid] = {
             "id": jid,
             "title": title or old.get("title") or jid,
@@ -288,6 +383,8 @@ def register(title, total=None, unit="项", job_id=None, source="script",
             "cmd": cmd or old.get("cmd"),
             "log_file": log_file or old.get("log_file"),
             "log": base_log,
+            "log_total": base_total,
+            "log_round": base_round,
             "planned_sec": (float(planned_sec) if planned_sec
                             else old.get("planned_sec")),
             "received_at": (float(received_at) if received_at is not None
@@ -326,10 +423,8 @@ def set_steps(job_id, steps):
         if j.get("current_step") is None or j.get("current_step") < 0:
             j["current_step"] = 0
         j["manual_steps"] = True        # 显式设置步骤列表 = 主动规划，自动映射退居日志
-        log = j.setdefault("log", [])
-        log.append("%s  计划 %d 步：%s" % (time.strftime("%H:%M:%S"), len(names),
-                                          " / ".join(names[:8])))
-        del log[:-MAX_LOG]
+        _log_push(j, ["%s  计划 %d 步：%s" % (time.strftime("%H:%M:%S"), len(names),
+                                             " / ".join(names[:8]))])
         j["updated_at"] = time.time()
         _safe_save(jobs)
     return j
@@ -354,10 +449,8 @@ def set_step(job_id, index, name=None):
         j["current_step"] = idx
         if idx != old_idx:                    # 只有真的推进了才记，避免重复推进刷屏
             nm = steps[idx] if 0 <= idx < len(steps) else ""
-            log = j.setdefault("log", [])
-            log.append("%s  ▶ 第%d/%d步 %s" % (time.strftime("%H:%M:%S"),
-                                               idx + 1, max(len(steps), 1), nm))
-            del log[:-MAX_LOG]
+            _log_push(j, ["%s  ▶ 第%d/%d步 %s" % (time.strftime("%H:%M:%S"),
+                                                  idx + 1, max(len(steps), 1), nm)])
         j["updated_at"] = time.time()
         _safe_save(jobs)
     return j
@@ -401,13 +494,9 @@ def update(job_id, done=None, total=None, message=None, status=None, unit=None,
             j["planned_sec"] = float(planned_sec)
         if message:
             j["message"] = str(message)
-            log = j.setdefault("log", [])
-            log.append("%s  %s" % (time.strftime("%H:%M:%S"), message))
-            del log[:-MAX_LOG]
+            _log_push(j, ["%s  %s" % (time.strftime("%H:%M:%S"), message)])
         if log_line:
-            log = j.setdefault("log", [])
-            log.append(str(log_line).rstrip())
-            del log[:-MAX_LOG]
+            _log_push(j, [str(log_line).rstrip()])
         if status:
             j["status"] = status
             if status in ("done", "failed", "aborted"):
@@ -842,9 +931,7 @@ def append_auto_step(job_id, label, complete=True):
             # 完成后该步即 ✓（current=len，所有步 i<cur）；进行中该步🔄（current=len-1）
             j["current_step"] = len(steps) if complete else len(steps) - 1
         j["manual_steps"] = j.get("manual_steps", False)
-        log = j.setdefault("log", [])
-        log.append("%s  %s" % (time.strftime("%H:%M:%S"), label))
-        del log[:-MAX_LOG]
+        _log_push(j, ["%s  %s" % (time.strftime("%H:%M:%S"), label)])
         j["updated_at"] = time.time()
         _safe_save(jobs)
     return j
