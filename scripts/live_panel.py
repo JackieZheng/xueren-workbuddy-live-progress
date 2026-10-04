@@ -590,7 +590,9 @@ def job_payload(j, now):
         "samples": [{"t": int(s[0] if isinstance(s, (list, tuple)) else s["t"]),
                      "d": (s[1] if isinstance(s, (list, tuple)) else s["d"])}
                     for s in arr[-120:]],
-        "samples_kind": samples_kind,   # "step"=每步耗时曲线（v1.0.67） / "done"=进度采样        "started_ts": started,
+        "samples_kind": samples_kind,   # "step"=每步耗时曲线（v1.0.67） / "done"=进度采样
+        "started_ts": started,          # 时间线「▶ 开始执行」的数据源（v1.0.68：曾被 v1.0.67
+                                        # 的注释行吞掉 → 前端拿到 undefined，开始执行时间不显示）
         "received_ts": j.get("received_at") or started,
         "steps": j.get("steps") or [],
         "current_step": int(j.get("current_step") or 0),

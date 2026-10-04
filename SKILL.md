@@ -7,7 +7,7 @@ slug: xueren-workbuddy-live-progress
 displayName: 雪人老师·[WorkBuddy]任务执行进度·实时面板
 summary: 完整任务执行过程（前台+后台）实时看板：从接到命令→执行中→结束，时间线/步骤进度条/进度环/速率/ETA/日志；前台任务每个工具调用默认自动映射成步骤，无需手动接入。
 description_en: A universal live progress panel for background tasks in a session.
-version: 1.0.67
+version: 1.0.68
 author: 雪人
 license: MIT
 allowed-tools: ""
