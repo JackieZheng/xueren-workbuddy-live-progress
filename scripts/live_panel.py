@@ -28,6 +28,62 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import progress as P  # noqa: E402
+import app_icons  # noqa: E402  # 应用自带单色 SVG 图标表（从 app.asar 原样照搬，勿手改）
+
+# 「会话内容」行的图标 key → 应用自带图标组件名（app_icons.APP_ICONS 的键）。
+# 工具类 key 的归属**逐字照搬**会话窗 toolIconEntries（见 humanize._TOOL_KEY_EXACT）；
+# ok/warn/fail 用应用的状态图标（原色），其余全部 currentColor 单色。
+ICON_KEY2COMP = {
+    "read": "ViewedToolIcon", "edit": "EditToolIcon", "run": "TerminalToolIcon",
+    "search": "SearchIcon", "folder": "FolderToolIcon", "browser": "BrowserUseToolIcon",
+    "computer": "ComputerUseToolIcon", "web": "GlobeIcon", "delete": "DeleteIcon",
+    "skill": "SkillToolIcon", "done": "CheckCircleToolIcon", "plan": "PlanToolIcon",
+    "agent": "AgentToolIcon", "image": "ImageToolIcon", "widget": "WidgetToolIcon",
+    "database": "DatabaseToolIcon", "cloud": "CloudToolIcon", "debug": "DebugToolIcon",
+    "location": "LocationIcon", "tool": "ToolDefaultIcon",
+    "ok": "SuccessToolIcon", "warn": "WarnToolIcon", "fail": "FailedIcon",
+    "loading": "LoadingToolIcon", "deep": "WbDeepIcon", "chat": "ChatBubbleIcon",
+    "pin": "WbPinIcon", "idea": "SparklesIcon", "data": "WbDataIcon",
+    "route": "WbGuidelineIcon",
+}
+
+
+def _icons_js():
+    """把面板用得到的图标打成 `const APP_ICONS = {…};` 的 JSON（key → svg 三件套）。"""
+    out = {}
+    for key, comp in ICON_KEY2COMP.items():
+        inner = app_icons.APP_ICONS.get(comp)
+        if not inner:
+            continue
+        out[key] = {"v": app_icons.APP_ICON_BOX.get(comp, "0 0 16 16"),
+                    "a": app_icons.APP_ICON_ATTRS.get(comp, 'fill="none"'),
+                    "s": inner}
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+try:
+    import humanize as HZ         # 「人话」词典（v1.0.59）：卡片元信息里的命令也讲通俗说法
+except Exception:
+    # ⚠️ 别名**不能叫 H**：本文件里 `class H(BaseHTTPRequestHandler)` 就是请求处理器，
+    #    同名会被后定义的类覆盖 → `/api/jobs` 直接 AttributeError 500，卡片全空，
+    #    panel_ctl 的 _probe 也跟着误判「面板未运行」。血坑，2026-10-04 实测踩到。
+    HZ = None
+
+
+def _say(*a, **kw):
+    """安全打印 —— 面板是 `pythonw.exe` 起来的，**`sys.stdout` / `sys.stderr` 可能是 None**。
+
+    裸 `print()` 在那种情况下会抛 `AttributeError: 'NoneType' object has no attribute 'write'`，
+    把进程当场掀掉：症状是 **WMI 报「创建成功」但端口永远不监听**
+    （`panel_ctl status` 一直说未运行，而同一份代码带 PIPE 前台跑却一切正常 —— 因为那时
+    stdout 是有效的）。所有启动 / 热更新日志一律走这里：宁可没输出，也不能崩。
+    """
+    for s in (sys.stdout, sys.stderr):
+        if s is None:
+            continue
+        try:
+            print(*a, file=s, **kw)
+        except Exception:
+            pass
+        return
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SKILL_NAME = "雪人老师·[WorkBuddy]任务执行进度·实时面板"
@@ -85,6 +141,74 @@ SAMPLES = {}             # job_id -> list[[ts, done]]
 JOB_START = {}           # job_id -> started_at（用于识别"同一 id 的新一轮运行"）
 LOCK = threading.Lock()
 
+# ---- 步骤事件（v1.0.67，推进曲线改造）-------------------------------------
+# 会话卡没有 total、done 恒 0 → 旧曲线全是 [t,0] 平线（用户："推进曲线基本是个摆设"）。
+# 现在在采样器里监听 (len(steps), current_step) 变化：每涨一次 = 完成一步 → 记一个事件
+# 时刻；曲线改成「每步耗时」柱状图（每根柱 = 该步花了多久，最后一根是当前步、实时增长）。
+STEP_EV = {}             # job_id -> [事件 ts...]（每步完成/插入时刻，≤24 个）
+STEP_N = {}              # job_id -> (len(steps), current_step) 上次快照
+STEP_BASE = {}           # job_id -> started_at（识别新一轮/回合清零）
+STEPS_FILE = os.path.join(P.ROOT, "step_events.json")
+STEP_EV_MAX = 24
+
+
+def load_step_events():
+    try:
+        with open(STEPS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        now = time.time()
+        for jid, rec in (raw or {}).items():
+            try:
+                ev = [float(t) for t in rec.get("ev") or [] if now - float(t) <= WINDOW]
+                n = rec.get("n")
+                base = rec.get("base")
+            except Exception:
+                continue
+            if ev and isinstance(n, list) and len(n) == 2:
+                STEP_EV[jid] = ev[-STEP_EV_MAX:]
+                STEP_N[jid] = (int(n[0]), int(n[1]))
+                STEP_BASE[jid] = base
+    except Exception:
+        pass
+
+
+def save_step_events():
+    try:
+        with LOCK:
+            data = {jid: {"n": list(STEP_N[jid]), "base": STEP_BASE.get(jid),
+                          "ev": [round(t, 1) for t in STEP_EV[jid]][-STEP_EV_MAX:]}
+                    for jid in STEP_N if STEP_EV.get(jid)}
+        os.makedirs(P.ROOT, exist_ok=True)
+        tmp = STEPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, STEPS_FILE)
+    except Exception:
+        pass
+
+
+def _track_steps(jid, j, now):
+    """监听一张卡的步骤进度变化（采样循环每秒调用一次，运行/非运行卡都过一遍——
+    回合清零/收尾也会改 steps，必须能识别出「倒退」并重建基线）。"""
+    n = (len(j.get("steps") or []), int(j.get("current_step") or 0))
+    prev = STEP_N.get(jid)
+    if prev is None:
+        # 面板重启后的首次见到：不补记、也**不清**——事件可能刚从 step_events.json 恢复
+        STEP_N[jid] = n
+        STEP_BASE[jid] = j.get("started_at")
+        return
+    if STEP_BASE.get(jid) != j.get("started_at") or n < prev:
+        # 新一轮运行（换了 started_at）/ 步骤清零（round_reset）→ 重建基线 + 清旧事件
+        STEP_EV[jid] = []
+        STEP_N[jid] = n
+        STEP_BASE[jid] = j.get("started_at")
+        return
+    if n > prev:
+        ev = STEP_EV.setdefault(jid, [])
+        ev.append(now)
+        del ev[:-STEP_EV_MAX]
+        STEP_N[jid] = n
+
 
 def load_samples():
     try:
@@ -112,14 +236,28 @@ def save_samples():
         pass
 
 
+DEV_SCRIPT_PREFIXES = ("_test_", "_probe_", "_demo_", "_debug_", "_selftest_", "_bench_")
+
+
 def _code_fingerprint():
-    """自身代码指纹（live_panel.py + progress.py 的内容哈希）——变了就该热更新。"""
+    """自身**运行期**代码指纹（scripts/ 下除开发级外全部 .py 的内容哈希）——变了就该热更新。
+
+    🔴 为什么是"全部 .py"而不是只哈希 live_panel.py + progress.py（v1.0.41 的写法）：
+    实测踩到——只改 `humanize.py`（词典/图标那一层）时指纹**毫无变化**，跑着的面板继续用
+    内存里的旧词典，表现为「磁盘改了、面板没变」，而 `panel_ctl.py status` 还报「一致 ✅」
+    （那个 build 只哈希 PAGE 页面源码）。凡是被面板 import 的运行期模块都要进指纹。
+    开发级脚本一律以下划线开头（`_test_` / `_probe_` / `_debug_` …，见文档分级铁律），
+    按此排除——改测试不该触发面板重启。
+    """
     try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        files = sorted(f for f in os.listdir(d)
+                       if f.endswith(".py") and not f.startswith("_"))
         h = hashlib.md5()
-        for p in (os.path.abspath(__file__),
-                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.py")):
-            with open(p, "rb") as f:
-                h.update(f.read())
+        for f in files:
+            h.update(f.encode("utf-8"))
+            with open(os.path.join(d, f), "rb") as fh:
+                h.update(fh.read())
         return h.hexdigest()
     except Exception:
         return None
@@ -178,7 +316,7 @@ def hot_reload_if_changed(force_check=False):
         CODE_FP[0] = fp
     if meta_changed and mfp is not None:
         META_FP[0] = mfp
-    print("[hot-reload] 检测到%s → 自动重启面板进程加载新%s" % (
+    _say("[hot-reload] 检测到%s → 自动重启面板进程加载新%s" % (
         "SKILL.md 元数据/版本变更" if meta_changed and not code_changed
         else ("代码变更 + SKILL.md 元数据变更" if meta_changed else "代码变更"),
         "版本" if meta_changed and not code_changed else "代码"), flush=True)
@@ -201,7 +339,7 @@ def hot_reload_if_changed(force_check=False):
                 pass
         os._exit(0)
     except Exception as e:
-        print("[hot-reload] 自动重启失败：%s —— 请手动执行 panel_ctl.py restart" % e,
+        _say("[hot-reload] 自动重启失败：%s —— 请手动执行 panel_ctl.py restart" % e,
               flush=True)
     return True
 
@@ -221,6 +359,7 @@ def sample_loop():
             with LOCK:
                 for j in P.list_jobs():
                     jid = j["id"]
+                    _track_steps(jid, j, now)   # v1.0.67：步骤事件监听（运行/非运行卡都要）
                     if j.get("status") != "running":
                         continue
                     d = int(j.get("done") or 0)
@@ -245,6 +384,7 @@ def sample_loop():
         n += 1
         if n % 60 == 0:          # 采样点密集了（1s 一拍），仍保持约 1 分钟落盘一次
             save_samples()
+            save_step_events()
         time.sleep(1)            # v1.0.36：5s→1s，会话状态反馈不拖沓
 
 
@@ -295,6 +435,28 @@ def _count_file_lines(path, max_lines=200000, max_bytes=8 * 1024 * 1024):
         return n
     except Exception:
         return 0
+
+
+def _step_series(jid, j, now):
+    """步骤事件 → 「每步耗时」曲线序列（v1.0.67）。
+
+    每根柱 = 一步实际花的时间：step0 从建卡（started_at/received_at）起算，
+    step_i = 两个事件间隔；最后一根是**当前步**（上个事件 → now/ended_at），
+    运行中它每秒被重算 → 曲线实时增长、新步骤一完成就多出一根柱——这就是"动起来"。
+    返回 [{t,d}]（与 done 采样同构，t=该步完成时刻）或 None（无事件）。
+    """
+    ev = list(STEP_EV.get(jid) or [])
+    if not ev:
+        return None
+    start = j.get("received_at") or j.get("started_at") or ev[0]
+    end = j.get("ended_at") or now
+    pts = []
+    prev_t = start
+    for t in ev:
+        pts.append({"t": int(t), "d": round(max(0.0, t - prev_t), 1)})
+        prev_t = t
+    pts.append({"t": int(end), "d": round(max(0.0, end - prev_t), 1)})
+    return pts
 
 
 def job_payload(j, now):
@@ -379,6 +541,19 @@ def job_payload(j, now):
     # 无总量且有时间基线 → 用**真实时间戳**折算进度曲线（否则 done 恒定，曲线是一条死线）
     if (not total) and running_like and planned and len(arr) >= 2:
         arr = [[t, round(min(99.0, max(0.0, (t - started) / planned * 100)))] for t, _ in arr]
+    # ---- 推进曲线选型（v1.0.67）--------------------------------------------
+    # 无总量、无预估的卡（会话卡为主）done 恒 0：有步骤事件 → 改用「每步耗时」曲线（会动）；
+    # 没有事件（还没跑出第一步）→ 交给前端「采样中…」占位，别再画一条 0 平线假曲线。
+    # planned 卡（脚本声明了预估耗时）维持原「时间基线」折算，行为不变。
+    samples_kind = "done"
+    if not total and not planned:
+        ser = _step_series(jid, j, now)
+        if ser is not None:
+            arr = ser
+            samples_kind = "step"
+        else:
+            arr = []
+    c_raw, c_plain = _cmd_fields(j)
     return {
         "id": jid,
         "title": j.get("title") or jid,
@@ -401,19 +576,76 @@ def job_payload(j, now):
         "time_pct": time_pct,
         "eta_overdue": eta_overdue,
         "source": j.get("source") or "script",
-        "cmd": (j.get("cmd") or "")[:160],
+        "cmd": c_raw,
+        # 「任务在做什么」的人话版（v1.0.59）：面板元信息里显示这个，原始命令/原话仍留在
+        # jobs.json 的 "cmd" 字段里供排障。v1.0.66：先剥 WB 注入块再人话化——用户原话
+        # （非命令）会**原样**显示，历史卡片里存的 `<task-notification>` 注入也整体滤掉。
+        "cmd_plain": c_plain,
         "cwd": (j.get("cwd") or "").replace("\\", "/").split("/")[-1],
         "session": (j.get("session_id") or "")[:6],
         "log_tail": log_tail[-10:],
         "log_count": log_count,      # 真实日志行数（不是 log_tail 的 10 行切片）= 当前任务/本回合
         "log_all": log_all,          # 本卡累计行数（跨回合），仅 tooltip 参考
-        "samples": [{"t": int(t), "d": d} for t, d in arr[-120:]],
-        "started_ts": started,
+        # arr 两种形态：done/time 曲线是 [t, d] 列表，step 曲线是 {"t","d"} 字典 → 统一成字典
+        "samples": [{"t": int(s[0] if isinstance(s, (list, tuple)) else s["t"]),
+                     "d": (s[1] if isinstance(s, (list, tuple)) else s["d"])}
+                    for s in arr[-120:]],
+        "samples_kind": samples_kind,   # "step"=每步耗时曲线（v1.0.67） / "done"=进度采样        "started_ts": started,
         "received_ts": j.get("received_at") or started,
         "steps": j.get("steps") or [],
         "current_step": int(j.get("current_step") or 0),
         "updated_ts": updated,
+        # 「会话内容」（v1.0.55，v1.0.59 改一行一条）：助手自己说的话，与机器日志分开放。
+        # 后端就截断，前端只管渲染 —— 面板上这一块是给用户**读结论**的，不是看明细的。
+        # 一格放 ~4 行（定高见 .rep），多出来靠滚动；只取尾部 REPLY_SHOW 条，别把 payload 撑大。
+        "reply": _reply_rows(j),
+        "reply_at": j.get("reply_at"),
     }
+
+
+def _cmd_fields(j):
+    """元信息里的「在做什么」：`(原文, 人话)`，两者都已剥掉 WB 注入块。
+
+    v1.0.66：早期直接对 `j["cmd"]` 做人话化，而会话卡的 `cmd` 存的是**用户原话**——自然
+    语言（「先不更新，我看下还有没有要优化的」）落进 `plain_command` 的兜底分支 → 元信息
+    显示成「运行系统命令（先不更新，我看下…）」；WB 注入的 `<task-notification>` 系统通知
+    同样中招（实测 8 张卡里 4 张）。现在先剥注入、再交给 humanize 分流（是命令就讲人话，
+    是原话就原样展示）。全是注入块 → 两个都返回空串（宁可不显示，也不显示机器话）。
+    """
+    raw = str(j.get("cmd") or "")
+    if not raw:
+        return "", ""
+    try:
+        raw = (P._strip_injection(raw) or raw).strip()
+    except Exception:
+        raw = raw.strip()
+    if not raw:
+        return "", ""
+    try:
+        return raw[:160], (HZ.plain_command(raw) if HZ else "")
+    except Exception:
+        return raw[:160], ""
+
+
+def _reply_rows(j):
+    """卡的「会话内容」行：历史行（本轮会话里出现过的每条内容）+ 需要时挂一行**活体**状态。
+
+    v1.0.60：助手正文逐条落卡（transcript 会话流增量同步）；思考块不落卡，改成
+    **只有模型此刻真在思考**时才在末尾临时挂一行「正在思考…」。
+    v1.0.62：默认收全会话流（用户口径）——思考块落历史行「深度思考」。
+    v1.0.63：图标改成**应用自带单色 SVG**——每行带 `ic`（图标 key），前端去
+    `APP_ICONS` 取 svg；`ic` 为空 = 正文自带图标（原样保留，不另配）。
+    活体行只在「末行不是思考历史行」时才补（末行已是「深度思考」就不必再叠一条）。
+    乐观口径：卡上这一行不写回 jobs.json，下一秒不思考了就自然消失。
+    """
+    rows = [{"t": x.get("t"), "text": str(x.get("text") or "")[:REPLY_PAYLOAD],
+             "ic": str(x.get("ic") or "")}
+            for x in (j.get("reply") or [])]
+    if (j.get("status") == "running" and j.get("stream_kind") == "think"
+            and (not rows or rows[-1].get("ic") != "deep")):
+        rows.append({"t": j.get("updated_at"), "text": P.THINK_ROW,
+                     "mid": "@live", "ic": "deep"})
+    return rows[-REPLY_SHOW:]
 
 
 def _is_active(j):
@@ -421,8 +653,60 @@ def _is_active(j):
     return j["status"] == "running" and not j["stale"]
 
 
+# ── 「会话内容」的回合内实时填充（v1.0.59）──────────────────────────────────
+# Stop hook 要等**回合结束**才把助手正文写进来，用户在回合进行中盯着面板时那格就是空的
+#（2026-10-04 用户实测反馈「会话内容没有输出内容」）。transcript 文件其实是**边说边写**的，
+# 所以这里在回合进行中就主动读 transcript 尾部，把已经说出口的话先同步上来。
+# ① 只对「运行中的 sess-* 卡」做；
+# ② 每张卡限频 REPLY_POLL_SEC；
+# ③ **文件没变就不读**（transcript 尾读是 6MB 级 IO，别每 3s 干一次白工）；
+# ④ 每条消息带行 id（mid），`progress.reply()` 按整表比对去重 → 同一条不会重复写，
+#    新消息到来时**逐条追加**（不是只留最新一条）。
+_REPLY_POLL = {}          # jid -> {"t": 上次轮询, "path": transcript 路径, "size":…, "mtime":…}
+REPLY_POLL_SEC = 3.0
+
+
+def _fill_live_reply():
+    """回合进行中就把助手已说出口的话同步到面板「会话内容」区（失败静默，绝不拖累面板）。"""
+    try:
+        jobs = P.load_jobs()
+    except Exception:
+        return
+    now = time.time()
+    for j in jobs.values():
+        jid = str(j.get("id") or "")
+        if not jid.startswith("sess-") or j.get("status") != "running":
+            continue
+        rec = _REPLY_POLL.get(jid) or {}
+        if now - (rec.get("t") or 0) < REPLY_POLL_SEC:
+            continue
+        sid = j.get("session_id") or jid[5:]
+        try:
+            f = P.transcript_path(sid)
+        except Exception:
+            f = None
+        if not f:
+            _REPLY_POLL[jid] = {"t": now}
+            continue
+        try:
+            st = os.stat(f)
+            size, mtime = st.st_size, st.st_mtime
+        except Exception:
+            size = mtime = None
+        if (rec.get("path") == f and rec.get("size") == size
+                and rec.get("mtime") == mtime):
+            _REPLY_POLL[jid] = {"t": now, "path": f, "size": size, "mtime": mtime}
+            continue                      # 文件没长 → 助手没新话，别做 6MB IO
+        _REPLY_POLL[jid] = {"t": now, "path": f, "size": size, "mtime": mtime}
+        try:
+            P.sync_stream(sid, jid)       # 本轮会话流增量同步（正文 + 思考，逐条）
+        except Exception:
+            continue
+
+
 def payload():
     now = time.time()
+    _fill_live_reply()
     jobs = [job_payload(j, now) for j in P.list_jobs()]
     act = [j for j in jobs if _is_active(j)]
     fin = [j for j in jobs if not _is_active(j)]
@@ -440,6 +724,10 @@ def payload():
             "total": len(jobs),
         },
         "jobs": jobs,
+        # 排障用：这张面板**进程里**实际生效的「会话内容」入卡类型。它是环境变量
+        # `LIVE_PROGRESS_STREAM_KINDS` 在进程启动那一刻决定的 —— 面板是会话外常驻进程，
+        # 改环境变量后不重启不生效，光看源码会误判（实测踩到：卡片里混进过工具行）。
+        "stream_kinds": list(P.STREAM_KINDS),
         # 前端据此判断「页面代码是否已过期」：服务端一重启（改了 UI），build 就变，
         # 已打开的旧标签页会在下一次轮询时自动 location.reload()，无需用户手动刷新。
         "build": BUILD,
@@ -538,6 +826,10 @@ def sys_payload():
 
 
 PORT = [8791]
+# 「会话内容」单条上传面板的字数上限（一行一条 + 中段省略，超长全文挂 title 悬停）
+REPLY_PAYLOAD = 260
+# 上传几条：面板一格只显示 ~4 行，多给一倍让用户能往回滚（每条 ~260B，别给太大）
+REPLY_SHOW = 8
 LOG_RESUME_SEC = [8.0]   # 日志区上滑后静默多少秒自动恢复跟随（见 --log-resume-sec）
 START_TS = [time.time()] # 本实例启动时刻
 LAST_HIT = [time.time()] # 最近一次 HTTP 请求时刻（"还有人在看"的判据）
@@ -553,7 +845,8 @@ PAGE = r"""<!DOCTYPE html>
 <title>__TITLE__</title>
 <link rel="icon" type="image/svg+xml" href="__FAVICON__">
 <style>
-:root{--bg:#0f1720;--card:#16212c;--line:#27384a;--tx:#e8eef5;--sub:#93a7bb;--acc:#3fb27f;--acc2:#e0a13a;--bad:#d9534f;--ink:#111a23}
+:root{--bg:#0f1720;--card:#16212c;--line:#27384a;--tx:#e8eef5;--sub:#93a7bb;--acc:#3fb27f;--acc2:#e0a13a;--bad:#d9534f;--ink:#111a23;
+--wb-status-success:#0CBF5B;--wb-status-warning:#FF7800;--wb-status-error:#F64041}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 "Microsoft YaHei",system-ui,-apple-system,sans-serif;padding:clamp(10px,2.6vw,20px)}
 .wrap{width:100%;max-width:1180px;margin:0 auto}
@@ -585,7 +878,15 @@ h1 .hicon{margin-right:6px}
         卡片内边距 14
       历史教训：这些值早期混用 clamp(…vw…) —— 视口一变，间距就变，窄的时候内容比盒子高、
       居中溢出后互相压叠（指标格盖住元信息），宽的时候又空出一大块。固定 px 后两头都没了。 */
-.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));align-items:start}
+/* 网格：flex 换行 + 卡片可伸展。
+   ⚠️ 为什么不用 `display:grid`：grid 的列轨是**整张表共享**的（如 3 列），
+   当最后一行只排 2 张时，第 3 条列轨仍被上面的行占着 → auto-fit 不会回收，
+   末行就永远在右侧留一块 398px 的空洞（实测 1600 宽：3+2 → 66% 填充）。
+   改 flex 换行后 `flex-grow:1` 按**行**分配剩余宽度：末行几张就撑满几张，
+   行内卡片等宽、左右零留白；同时 flex-basis 取 min(340px,100%)，
+   每行放得下几张与原来 grid 的口径一致（窄屏退化为单列满宽）。 */
+.grid{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start}
+.grid>.card{flex:1 1 min(340px,100%);min-width:0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;min-width:0;overflow:hidden}
 .chead{display:flex;gap:8px;align-items:flex-start;justify-content:space-between;margin-bottom:10px}
 /* 标题：强制单行不换行；过长时走「中段省略」（保留开头与结尾，比尾省略信息量大） */
@@ -632,6 +933,23 @@ h1 .hicon{margin-right:6px}
 .dots.empty{display:flex;align-items:center;justify-content:center;color:var(--sub);font-size:10px;border:1px dashed var(--line);border-radius:10px;height:52px}
 /* 日志区：固定高度（不再随行数变化），超出纵向滚动；配深色滚动条 */
 pre{background:#0c141b;border:1px solid var(--line);border-radius:10px;padding:9px;height:92px;overflow:auto;font-size:10.5px;color:#a9c2d6;margin:0;white-space:pre-wrap;word-break:break-word}
+/* 「会话内容」区（v1.0.55 建，v1.0.59 改「一行一条」）：助手自己说的话 —— 与机器日志同规格
+   但配色更亮（这一块是给用户读结论的）。**每条助手消息一行**，超宽走中段省略，全文挂 title 悬停。
+   ⚠️ 定高 80px：padding 7×2 后内容区 66px = **4 行 × 16.5px 行高**，正好整数行；
+   所有卡片都渲染这一区（空态也占位），所以各卡仍等高 —— 别改成长度自适应、也别改零散行高。 */
+.rep{background:#0c141b;border:1px solid #2f5f4a;border-radius:10px;padding:7px 10px;
+  height:80px;overflow:auto;font-size:11px;line-height:16.5px;color:#d8ecdf;margin:0 0 12px}
+.rep .ai{height:16.5px;line-height:16.5px;display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden}
+.rep .ric{flex:0 0 auto;width:13px;height:13px;display:flex;align-items:center;justify-content:center}
+.rep .ric svg{width:13px;height:13px;display:block}
+.rep .rt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:clip}
+/* 行首不再插装饰点：图标由**正文自带**（v1.0.59，后端 with_icon() 按类型挑一个，
+   助手原文已经有 emoji 就保留原样，不叠两个） */
+.rep .none{color:var(--sub);font-size:10px;line-height:1.6;white-space:normal}
+.rep::-webkit-scrollbar{width:8px;height:8px}
+.rep::-webkit-scrollbar-track{background:transparent}
+.rep::-webkit-scrollbar-thumb{background:#2a3a48;border-radius:8px}
+.rep::-webkit-scrollbar-thumb:hover{background:#3d5265}
 pre::-webkit-scrollbar,.steps::-webkit-scrollbar{width:8px;height:8px}
 pre::-webkit-scrollbar-track,.steps::-webkit-scrollbar-track{background:transparent}
 pre::-webkit-scrollbar-thumb,.steps::-webkit-scrollbar-thumb{background:#2a3a48;border-radius:8px}
@@ -707,9 +1025,9 @@ pre::-webkit-scrollbar-thumb:hover,.steps::-webkit-scrollbar-thumb:hover{backgro
 .fold>summary:hover{color:var(--tx)}
 .fold .arrow{flex:0 0 auto;transition:transform .18s ease}
 .fold[open] .arrow{transform:rotate(90deg)}
-.fold .foldgrid{padding:0 clamp(10px,1.8vw,16px) clamp(12px,2vw,16px);grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr))}
+.fold .foldgrid{padding:0 clamp(10px,1.8vw,16px) clamp(12px,2vw,16px)}
 /* 折叠区内的卡片改为紧凑模式：隐去步骤/曲线/日志，只留状态/指标/元信息 */
-.card.mini .t,.card.mini .dots,.card.mini pre,.card.mini .steps{display:none!important}
+.card.mini .t,.card.mini .dots,.card.mini pre,.card.mini .steps,.card.mini .rep{display:none!important}
 /* 删除记录：图标按钮 + 二次确认（不做弹窗，避免预览面板里 confirm 被拦） */
 .xdel{flex:0 0 auto;border:1px solid var(--line);background:var(--ink);color:var(--sub);
   border-radius:8px;padding:2px 9px;font-size:11px;line-height:1.6;
@@ -774,6 +1092,13 @@ const RA=52, RC=2*Math.PI*RA;      // 环半径/周长（viewBox 132）
 const CARDS={};                    // id -> {el, refs}
 const LAST={};                     // id -> samples 用于重绘
 const DATA={};                     // id -> 本轮数据，尺寸变化时据此重排形态（环式/条式）
+// 应用自带单色 SVG 图标（v1.0.63，从 app.asar 原样照搬）：key → {v:viewBox, a:svg属性, s:内层节点}
+const APP_ICONS=__APP_ICONS_JSON__;
+function ricSvg(key){
+  const ic=APP_ICONS[key];
+  if(!ic) return '';
+  return '<svg viewBox="'+ic.v+'" '+(ic.a||'fill="none"')+'>'+ic.s+'</svg>';
+}
 
 /* 指标格排布：**恒定 2×2**（4 格永远两行两列，不再按宽度切 4+0 / 1×4）。
    早期按实测宽度在 4+0 / 2+2 / 1×4 之间切换，留下两个坑：
@@ -787,17 +1112,31 @@ function layoutStats(el){
   el.style.gridTemplateColumns='repeat(2, minmax(0,1fr))';
   el.dataset.cols=2;
 }
-/* 推进曲线：柱高百分比封顶 100%、柱数按容器宽下采样、容器 overflow:hidden 兜底 */
-function drawDots(ds, s){
+/* 推进曲线：柱高百分比封顶 100%、柱数按容器宽下采样、容器 overflow:hidden 兜底。
+   v1.0.67 两种口径：kind='done' 进度采样（旧，相对首尾差值归一）；
+   kind='step' 每步耗时（会话卡，基线固定 0，柱高∝该步耗时，最后一根实时增长） */
+function drawDots(ds, s, kind){
   const W=ds.clientWidth, H=ds.clientHeight;
   if(W<=0||H<=0) return;
-  if(!s||s.length<2){ ds.className='dots empty'; ds.textContent='采样中…'; return; }
+  if(!s||s.length<2){ ds.className='dots empty'; ds.textContent='采样中…'; ds.title=''; return; }
   ds.className='dots';
   const PITCH=5, maxBars=Math.max(6, Math.floor((W+2)/PITCH));
   let arr=s;
   if(s.length>maxBars){ const step=(s.length-1)/(maxBars-1); arr=[]; for(let i=0;i<maxBars;i++) arr.push(s[Math.round(i*step)]); }
-  const mn=arr[0].d, mx=arr[arr.length-1].d, span=Math.max(mx-mn,1);
-  ds.innerHTML=arr.map(p=>{ const pct=Math.max(10,Math.min(100,10+90*((p.d-mn)/span))); return '<i style="height:'+pct.toFixed(1)+'%"></i>'; }).join('');
+  let mn=0, span=1;
+  if(kind==='step'){
+    let mx=0; for(let i=0;i<arr.length;i++) if(arr[i].d>mx) mx=arr[i].d;
+    span=Math.max(mx,1);
+    ds.title='推进曲线：每根柱 = 该步耗时 · 最后一根是当前步（实时增长）';
+  }else{
+    mn=arr[0].d; span=Math.max(arr[arr.length-1].d-mn,1);
+    ds.title='';
+  }
+  ds.innerHTML=arr.map(p=>{
+    const pct = kind==='step'
+      ? Math.max(4, Math.min(100, 100*(p.d/span)))
+      : Math.max(10, Math.min(100, 10+90*((p.d-mn)/span)));
+    return '<i style="height:'+pct.toFixed(1)+'%"></i>'; }).join('');
 }
 /* 文本转义：步骤名/日志常含 < > & " 等字符，防注入、也防止把 title 属性撑破 */
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -896,12 +1235,17 @@ function buildCard(d){
     // 不能靠 parentNode.querySelector('.t') —— 那会命中卡片里**第一个** .t（即「执行步骤」）
     '<div class="t tdots">推进曲线</div><div class="dots"></div>'+
     '<div class="meta"></div>'+
+    // 「会话内容」：会话里出现过的一切（正文 / 深度思考 / 执行项）——Stop hook 自动抓 transcript，
+    // 脚本也可用 progress.py reply 主动写。（v1.0.64 从旧名「会话内容」改名：v1.0.62 起已收全会话流，
+    // 旧名名不副实。）
+    '<div class="t treply">会话内容</div><div class="rep"></div>'+
     '<div class="t">日志（尾部）</div><pre></pre>';
   const refs={title:el.querySelector('.ctitle'),badge:el.querySelector('.badge'),dot:el.querySelector('.dot'),
     btxt:el.querySelector('.btxt'),body:el.querySelector('.cbody'),left:el.querySelector('.cleft'),
     stats:el.querySelector('.stats'),dots:el.querySelector('.dots'),meta:el.querySelector('.meta'),log:el.querySelector('pre'),
     tl:el.querySelector('.tl'),steps:el.querySelector('.steps'),stepsTitle:el.querySelector('.tsteps'),
-    dotsTitle:el.querySelector('.tdots'),xdel:el.querySelector('.xdel')};
+    dotsTitle:el.querySelector('.tdots'),xdel:el.querySelector('.xdel'),
+    treply:el.querySelector('.treply'),reply:el.querySelector('.rep')};
   // 单条删除：点一次变「确认？」，4 秒内再点一次才真删（运行中的任务不显示此按钮）
   refs.xdel.addEventListener('click',function(e){
     e.preventDefault(); e.stopPropagation();
@@ -925,8 +1269,50 @@ function buildCard(d){
       l._resumeT=setTimeout(function(){ l.dataset.stick='1'; l.scrollTop=l.scrollHeight; }, LOG_RESUME_MS);
     }
   });
+  // 「会话内容」同理：用户上滑看更早的消息时别被 2 秒轮询硬拽回底部（v1.0.59）
+  refs.reply.addEventListener('scroll', function(){
+    const p=refs.reply;
+    if(p.scrollHeight - p.scrollTop - p.clientHeight < 8){
+      p.dataset.stick='1';
+      clearTimeout(p._resumeT);
+    }else{
+      p.dataset.stick='0';
+      clearTimeout(p._resumeT);
+      p._resumeT=setTimeout(function(){ p.dataset.stick='1'; p.scrollTop=p.scrollHeight; }, LOG_RESUME_MS);
+    }
+  });
   CARDS[d.id]={el:el,refs:refs};
   return CARDS[d.id];
+}
+/* 「会话内容」渲染（v1.0.59）：**一行一条** —— 每行对应聊天里的一条助手消息。
+   超宽走中段省略（fitMiddle：二分出最长的可显示长度，保留首尾），完整文本挂 title 悬停。
+   ⚠️ 定高容器（.rep = 4 行）：空态也要占位，否则各卡片不再等高。
+   ⚠️ 宽度变化（折叠区展开 / 视口改变 → relayout() 重跑 renderCard）必须重算省略位置，
+      所以这里**不做「文本没变就整段跳过」**，只跳过 DOM 重建、每次都重跑 fitMiddle。 */
+function setReply(el, arr){
+  const items=arr||[];
+  if(!items.length){
+    const t='<div class="none">（本轮会话还没内容 · 正文与执行项会自动同步到这里）</div>';
+    if(el.dataset.txt!==t){ el.dataset.txt=t; el.innerHTML=t; el._rows=null; }
+    return;
+  }
+  // 分隔符用 String.fromCharCode(1) 做「内容指纹」——**别写 '\\u0001'**：PAGE 是 raw 字符串
+  // 指纹里带上 ic：图标 key 变了也要重建行（行内含 svg，不能只换文字）
+  const SEP=String.fromCharCode(1);
+  const key=items.map(function(x){ return String(x.text||'')+String.fromCharCode(2)+(x.ic||''); }).join(SEP);
+  if(el.dataset.txt!==key || !el._rows || el._rows.length!==items.length){
+    el.dataset.txt=key;
+    el.innerHTML=items.map(function(x){
+      const ic=x&&x.ic?ricSvg(x.ic):'';
+      return '<div class="ai"><span class="ric">'+ic+'</span><span class="rt"></span></div>';
+    }).join('');
+    el._rows=[].slice.call(el.querySelectorAll('.ai')).map(function(row){
+      return {row:row, txt:row.querySelector('.rt')};
+    });
+  }
+  for(let i=0;i<el._rows.length;i++)
+    fitMiddle(el._rows[i].txt, String((items[i]||{}).text||''));
+  if(el.dataset.stick!=='0') el.scrollTop=el.scrollHeight;
 }
 /* 日志自动跟随：内容变化时滚到底，始终露出最后一行 */
 function setLog(el, lines){
@@ -1061,17 +1447,19 @@ function renderCard(c,d){
   LAST[d.id]=d.samples;
   // 与「执行步骤」同理：曲线区是固定分区，无采样也要**留位**（保证各卡片等高），
   // 占位文案由 drawDots() 内部渲染成「采样中…」。
-  drawDots(r.dots, d.samples);
+  drawDots(r.dots, d.samples, d.samples_kind);
   r.dots.style.display='';
   if(r.dotsTitle) r.dotsTitle.style.display='';
   // 元信息 + 日志
   const bits=[];
   if(d.message) bits.push(d.message);
   bits.push('更新于 '+fmtAgo(d.ago));
-  if(d.cmd) bits.push('命令: '+d.cmd);
+  if(d.cmd_plain) bits.push('在做什么: '+d.cmd_plain);
+  else if(d.cmd) bits.push('命令: '+d.cmd);
   if(d.cwd) bits.push('目录: '+d.cwd);
   if(d.session) bits.push('会话: '+d.session);
   setMarquee(r.meta, bits.join(' · '));
+  setReply(r.reply, d.reply);        // 会话内容（在日志之前，用户视线先看到结论）
   setLog(r.log, d.log_tail);
 }
 /* 元信息：永远单行；文本超出容器宽度才启动走马灯（否则静止显示，避免短文空转） */
@@ -1343,6 +1731,10 @@ setInterval(tick,1000); tick();   /* v1.0.36：2s→1s，尽量跟手（后端�
 </script></body></html>
 """
 
+# 把应用自带图标表注进页面（JSON 直接替换占位 token；PAGE 是 raw 字符串，JSON 里的
+# 反斜杠/引号原样进 JS 没问题）。⚠️ 必须在算 BUILD 之前做——图标变了页面也要重载。
+PAGE = PAGE.replace("__APP_ICONS_JSON__", _icons_js())
+
 # 页面代码指纹：服务端一重启（PAGE 有改动）指纹就变，旧标签页下次轮询即自动重载。
 BUILD = hashlib.md5(PAGE.encode("utf-8")).hexdigest()[:10]
 
@@ -1506,22 +1898,23 @@ def main():
 
     # 幂等：端口上已有面板就直接复用，不再起第二个实例（双击启动脚本会走到这里）
     if _already_running(args.port):
-        print("面板已在运行: http://127.0.0.1:%d/  （本次启动自动跳过）" % args.port, flush=True)
+        _say("面板已在运行: http://127.0.0.1:%d/  （本次启动自动跳过）" % args.port, flush=True)
         return 0
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
     except OSError as e:
-        print("启动失败：端口 %d 被其他程序占用（%s）。换端口：--port 8792" % (args.port, e), flush=True)
+        _say("启动失败：端口 %d 被其他程序占用（%s）。换端口：--port 8792" % (args.port, e), flush=True)
         return 1
     SRV[0] = srv                      # 供热更新使用（exec 前要关监听套接字）
     CODE_FP[0] = _code_fingerprint()  # 以「本次启动时的代码」为基线
     load_samples()
+    load_step_events()                # v1.0.67：恢复步骤事件（重启不丢历史曲线）
     threading.Thread(target=sample_loop, daemon=True).start()
     if args.idle_exit or args.ttl:
         threading.Thread(target=_watchdog, args=(srv, args.idle_exit, args.ttl),
                          daemon=True).start()
-    print("通用任务执行进度·实时面板: http://127.0.0.1:%d/  (jobs=%s%s)"
+    _say("通用任务执行进度·实时面板: http://127.0.0.1:%d/  (jobs=%s%s)"
           % (args.port, P.JOBS,
              "，空闲 %.0f 分钟自动退出" % (args.idle_exit / 60.0) if args.idle_exit else ""),
           flush=True)
@@ -1531,6 +1924,6 @@ def main():
 if __name__ == "__main__":
     # --build：只打印当前代码的页面指纹并退出（panel_ctl 用它判断「跑着的是不是旧版」）
     if "--build" in sys.argv[1:]:
-        print(BUILD, flush=True)
+        _say(BUILD, flush=True)
         sys.exit(0)
     sys.exit(main() or 0)

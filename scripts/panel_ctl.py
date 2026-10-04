@@ -37,6 +37,12 @@ PORT_SCAN = range(8791, 8800)      # status 找不到时顺手扫一圈，便于
 ROOT = (os.environ.get("LIVE_PROGRESS_DIR")
         or os.path.join(os.path.expanduser("~"), ".workbuddy", "live-progress"))
 STATE_FILE = os.path.join(ROOT, "panel_state.json")   # 记录"谁、用什么方式、带哪些参数"起的面板
+# WMI 拉起时的 stdout/stderr 落点（**每次启动截断**）。用途有二：
+#   ① 排障：WMI 报「创建成功」但进程秒退时，这里是唯一能看到 traceback 的地方；
+#   ② 修坑：给 pythonw 一个**有效的标准输出句柄** —— WMI（Win32_Process.Create）
+#      创建进程不给标准句柄，pythonw 下 `sys.stdout` 会是 None，任何裸 print 都会
+#      抛 AttributeError 把进程当场掀掉（2026-10-04 实测踩到）。
+SPAWN_LOG = os.path.join(ROOT, "panel_spawn.log")
 
 # hook 自动拉起的实例带空闲自退：既能在会话外常驻，又不会留下永久僵尸面板
 AUTO_IDLE_EXIT = 1800.0            # 秒（30 分钟）
@@ -263,7 +269,17 @@ def _spawn_detached(port, extra=()):
     """
     pyw, script = _pythonw(), PANEL
     tail = "".join(" %s" % a for a in extra)
-    if _wmi_create('"%s" "%s" --port %d%s' % (pyw, script, int(port), tail)):
+    # 用 cmd /c 包一层做输出重定向：既给子进程一个有效的 stdout 句柄（否则 pythonw 下
+    # sys.stdout 为 None，裸 print 会直接崩），又把 traceback 落到 SPAWN_LOG 供事后查。
+    # 注意 cmd 的引号规矩：整条命令还要再套一层双引号。
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        open(SPAWN_LOG, "w", encoding="utf-8").close()      # 每次启动截断，只看这一次
+    except Exception:
+        pass
+    wrapped = ('cmd /c ""%s" "%s" --port %d%s >> "%s" 2>&1"'
+               % (pyw, script, int(port), tail, SPAWN_LOG))
+    if _wmi_create(wrapped):
         return "wmi", True
     flags = 0
     if os.name == "nt":

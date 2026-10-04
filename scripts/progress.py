@@ -39,8 +39,29 @@ try:  # 让 Windows 控制台也能print中文
 except Exception:
     pass
 
+def home_dir():
+    """可靠地取用户主目录。
+
+    ⚠️ 不能只靠 `os.path.expanduser("~")`：**WMI（Win32_Process.Create）创建进程时
+    不加载用户配置文件**，`USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` 都可能缺失，
+    expanduser 会原样返回 `"~"` —— 面板于是去读一个名叫 `~` 的相对目录，
+    卡片全空（实测空环境下 jobs 路径会变成 `~\\.workbuddy\\live-progress\\jobs.json`）。
+    先看环境变量，再退回 expanduser；最后一个都没有时用 __file__ 相对定位也没意义，
+    直接返回 expanduser 的结果（至少不崩）。
+    """
+    for k in ("USERPROFILE", "HOME"):
+        v = os.environ.get(k)
+        if v and os.path.isdir(v):
+            return v
+    drive, path = os.environ.get("HOMEDRIVE"), os.environ.get("HOMEPATH")
+    if drive and path and os.path.isdir(drive + path):
+        return drive + path
+    got = os.path.expanduser("~")
+    return got if got and got != "~" else os.getcwd()
+
+
 ROOT = os.environ.get("LIVE_PROGRESS_DIR") or os.path.join(
-    os.path.expanduser("~"), ".workbuddy", "live-progress")
+    home_dir(), ".workbuddy", "live-progress")
 JOBS = os.path.join(ROOT, "jobs.json")
 LOCK = os.path.join(ROOT, "jobs.lock")
 PANEL_PORT = int(os.environ.get("LIVE_PROGRESS_PORT") or 8791)
@@ -49,6 +70,35 @@ MAX_JOBS = 40          # 注册表最多保留条数（按更新时间）
 # 默认 40：jobs.json 体积与面板轮询开销的平衡。要留住长会话的早期日志，用环境变量放大：
 #   LIVE_PROGRESS_MAX_LOG=300 python progress.py ...   （或在面板同环境里 export 后启动）
 MAX_LOG = int(os.environ.get("LIVE_PROGRESS_MAX_LOG") or 40)
+# ── 「会话内容」区（v1.0.55）：面板卡片新增一块展示**助手自己说的话**（transcript 抓 /
+#    脚本主动 reply）。与日志分开：日志是机器明细，会话内容是给用户在预览区直接读的结论。
+#    v1.0.59：面板改为**一行一条**（逐条对应聊天里的每条助手消息），所以这里多留几条
+#    （v1.0.62 起 40 —— 默认收全会话流后 tool/think 行也占窗口，与 STREAM_LIMIT 对齐；
+#    面板只取尾部若干条渲染，见 live_panel.REPLY_SHOW）；文本经 `humanize`
+#    转成人话（去 markdown / 技术名词中文化 / 行内命令讲通俗说法）。
+MAX_REPLY = int(os.environ.get("LIVE_PROGRESS_MAX_REPLY") or 40)   # 卡片保留最近 N 条
+REPLY_MAXLEN = int(os.environ.get("LIVE_PROGRESS_REPLY_LEN") or 300)  # 单条截断字数
+try:
+    import humanize as _H
+except Exception:                       # 词典缺失也不能让上报挂掉
+    _H = None
+
+
+def _human(text, limit=0):
+    """助手正文 → 单行人话（压换行 / 去 markdown / 技术名词中文化）。
+
+    ⚠️ v1.0.63 起**不再往正文里拼图标**——图标改成独立的 `ic` key（`humanize.icon_key`），
+    面板据此渲染应用自带的单色 SVG（用户口径：用原来的图标，别拼 emoji）。正文保持原样，
+    助手自己写的 emoji 一个字不动；`humanize` 缺失/关闭时退化为压缩空白后的原文。
+    """
+    if _H is not None:
+        try:
+            s = _H.plain_text(text)
+            return s[:limit] if limit and len(s) > limit else s
+        except Exception:
+            pass
+    s = " ".join(str(text or "").split())
+    return s[:limit] if limit and len(s) > limit else s
 
 
 def _log_trim(seq):
@@ -346,9 +396,12 @@ def register(title, total=None, unit="项", job_id=None, source="script",
             norm_steps = [str(s).strip() for s in raw_steps if str(s).strip()]
         else:
             norm_steps = None
-        # 日志基线：保留旧日志；本次若显式接入步骤，补一行「接入 N 步」——让「只上报步骤、
-        # 不单独写日志」的任务（如定时任务 begin --steps）也能在日志区看到东西（不再是 0 行）。
-        base_log = list(old.get("log") or [])
+        # 日志基线：v1.0.65 起 **新回合（round_reset=True，用户在同会话提交新命令）日志清零重开**——
+        # 旧回合的日志行留在上一回合，新回合从空开始（用户 2026-10-04 反馈「新起会话
+        # 日志还挂着之前的内容」；会话内容自始就是按回合清零的，只有日志漏了）。
+        # 跨回合累计账本 log_total **保留**（「本轮 N 行 · 累计 M 行」的账不变量仍成立）。
+        # 脚本路径（begin / register 不带 round_reset）不受影响，日志照旧保留。
+        base_log = [] if round_reset else list(old.get("log") or [])
         # 累计日志行数基线：优先沿用旧计数（register 会重建 dict，必须显式保留），
         # 老任务没有这个字段时退化成当前保留行数，保证不计入后面重复累加。
         base_total = int(old.get("log_total") or len(base_log) or 0)
@@ -380,7 +433,11 @@ def register(title, total=None, unit="项", job_id=None, source="script",
             "source": source or old.get("source") or "script",
             "session_id": session_id or old.get("session_id"),
             "cwd": cwd or old.get("cwd") or os.getcwd(),
-            "cmd": cmd or old.get("cmd"),
+            # round_reset（同会话新回合）视为换了一件任务：本轮没给 cmd 就**不保留**上一轮的
+            # 用户原话（与 v1.0.65 的日志清零同源：新回合还挂着上一轮内容会让用户以为没重置）。
+            # 脚本卡（不带 round_reset）照旧沿用旧值。
+            "cmd": (cmd if cmd is not None
+                    else (None if round_reset else old.get("cmd"))),
             "log_file": log_file or old.get("log_file"),
             "log": base_log,
             "log_total": base_total,
@@ -481,6 +538,7 @@ def update(job_id, done=None, total=None, message=None, status=None, unit=None,
             j = {"id": job_id, "title": job_id, "status": "running", "done": 0, "total": None,
                  "unit": "项", "message": "", "source": "script", "session_id": None,
                  "cwd": os.getcwd(), "cmd": None, "log_file": None, "log": [],
+                 "reply": [], "reply_at": None,
                  "planned_sec": None,
                  "started_at": now, "updated_at": now, "ended_at": None}
             jobs[job_id] = j
@@ -557,8 +615,565 @@ def finish_session(session_id=None, ok=True, message=None):
     return ended
 
 
+# ----------------------------------------------------------------「会话内容」区（v1.0.55）
+# ⚠️ 隔离测试（_test_attach_contract.py 等）要指一个假 transcript 目录，而
+# TRANSCRIPT_DIR 是模块级常量、hook 子进程又继承环境变量 —— 所以留一道环境变量开关，
+# 比"改 HOME"安全得多（不会误伤真实会话数据）。
+TRANSCRIPT_DIR = (os.environ.get("LIVE_PROGRESS_TRANSCRIPTS")
+                  or os.path.join(home_dir(), ".workbuddy", "projects"))
+
+
+def transcript_path(session_id):
+    """会话 transcript 路径：`~/.workbuddy/projects/<工作区目录>/<session_id>.jsonl`。
+
+    目录名由「盘符 + 去冒号的工作区路径」拼成（实测 `D-Users-JackieZheng-WorkBuddy-2026-…`），
+    一个工作区一个目录、里面按 session uuid 放一条 jsonl。这里**只按文件名匹配**，
+    不去解析目录内容（projects 下可能有上百个目录，扫内容太慢）。
+    """
+    if not session_id:
+        return None
+    try:
+        if not os.path.isdir(TRANSCRIPT_DIR):
+            return None
+        for d in os.listdir(TRANSCRIPT_DIR):
+            f = os.path.join(TRANSCRIPT_DIR, d, "%s.jsonl" % session_id)
+            if os.path.isfile(f):
+                return f
+    except Exception:
+        return None
+    return None
+
+
+# ------------------------------------------------- 用户输入（文本 + 附件）v1.0.57
+# transcript 里每条 user 消息的第一个 input_text 常常是 WB 注入的
+# `<system-reminder data-role="user-context">…</system-reminder>`（系统/身份注入，
+# 不是用户话），认它当用户输入会把纯图片提交误判成「有文本」。
+# ⚠️ 三个坑：① 必须 raw 字符串（"…\1…" 会被 Python 吃掉反斜杠变成 chr(1)）；
+#            ② 标签名要用**命名捕获组**再 (?P=tag) 回引——(?:…) 是非捕获组，
+#              `\1` 会直接报 "invalid group reference"（实测踩到）；
+#            ③ 标签清单要跟着 WB 实际注入的标签走——实测扫 609 个 transcript、
+#              2386 个 user text 块的标签词频，纯图片提交的 input_text 整块就是
+#              `<image_local_path>C:\…\clipboard-xxx.png</image_local_path>`
+#              （一个占位符，不是用户话）；还有 `<user_query>` 会把真话裹起来。
+#              这两类漏掉的话，纯图片提交的卡片标题会变成一长条 Windows 路径。
+_INJECT_TAGS = ("system-reminder", "command-name", "command-message",
+                "image_local_path", "user_query",
+                "previous_user_message", "previous_assistant_message",
+                "previous_tool_call", "conversation_history_summary",
+                "summary", "automation_system_reminder",
+                "memory_and_skills_reminder", "additional_data",
+                "current_time", "identity_context", "product_identity",
+                "project_context", "project_layout", "connector-status",
+                "user_info", "task-notification")
+_INJECT_INNER = re.compile(r"<\s*(?P<tag>%s)"
+                           r"[\s\S]*?(?:</\s*(?P=tag)\s*>|$)" % "|".join(_INJECT_TAGS),
+                           re.I)
+
+
+# `<user_query>…</user_query>` 是**壳**：标签是 WB 加的，里面那句才是用户真话。
+# 和 system-reminder 相反（那是要连内容一起删掉的注入块），这里只剥壳、留真话。
+_QUERY_WRAP = re.compile(r"<\s*user_query\s*>([\s\S]*?)</\s*user_query\s*>", re.I)
+
+
+def _strip_injection(s):
+    """抠掉注入块（含未闭合的），返回真正属于用户的那点文字。
+
+    `<user_query>真话</user_query>` → 只剥壳保留「真话」；
+    `<image_local_path>…</image_local_path>` 纯占位符 → 整块删掉（→ 空串）。
+    """
+    s = str(s or "")
+    m = _QUERY_WRAP.search(s)
+    if m:
+        s = s[:m.start()] + m.group(1) + s[m.end():]
+    return _INJECT_INNER.sub(" ", s).strip()
+
+
+def _user_blocks(path, from_end=True, read_mb=8):
+    """取 transcript 里**最后一条** user 消息的 content blocks。
+
+    早期版本把所有 user 消息的行都攒起来，结果「最近一条只有音频」也会被前面
+    几条纯图片的附件算进来（实测踩到）。现在遇新 user 消息就丢弃旧攒的。
+    """
+    blocks = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(max(0, size - read_mb * 1048576) if from_end else 0)
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") != "message":
+                    continue
+                m = o.get("message")
+                role = m.get("role") if isinstance(m, dict) else None
+                if role is None:
+                    role = o.get("role")
+                if role != "user":
+                    continue
+                blocks = []                       # 新的 user 消息 → 旧的整条作废
+                c = m.get("content") if isinstance(m, dict) else o.get("content")
+                if isinstance(c, str):
+                    blocks.append({"type": "input_text",
+                                   "text": _strip_injection(c)})
+                elif isinstance(c, list):
+                    blocks.extend([b for b in c if isinstance(b, dict)])
+    except Exception:
+        return []
+    return blocks
+
+
+# 实测（586 个历史 transcript 全量扫过）：纯图片提交时用户在 transcript 里是
+#   {"type":"message","role":"user","content":[
+#       {"type":"input_text","text":"…"},
+#       {"type":"image_blob_ref","mime":"image/png","original_filename":"Clipboard_Screenshot.png",…}]}
+# 音频 / 视频 / 文件是同一族 blob_ref（只实证到 image_blob_ref，故归类**以 mime 为主、
+# type 为辅**，别写死死板的 type 名）。
+_ATTACH_GROUPS = (
+    ("图片", ("image", "img", "photo", "picture", "png", "jpg", "jpeg", "gif", "webp")),
+    ("音频", ("audio", "voice", "speech", "mp3", "wav", "m4a", "flac", "record")),
+    ("视频", ("video", "movie", "mp4", "mov", "webm")),
+)
+_ATTACH_FALLBACK = "文件"
+_ATTACH_UNIT = {"图片": "张"}          # 其余一律「个」
+
+
+def classify_attachment(blk):
+    """把一个 transcript content block 归类成「图片 / 音频 / 视频 / 文件」，认不出返回 None。"""
+    if not isinstance(blk, dict):
+        return None
+    blob = "%s %s" % (blk.get("type") or "", blk.get("mime") or "")
+    blob = str(blob).lower()
+    if not blob.strip():
+        return None
+    for name, keys in _ATTACH_GROUPS:
+        for k in keys:
+            if k in blob:
+                return name
+    return _ATTACH_FALLBACK if "blob" in blob or "file" in blob else None
+
+
+# 用户文本块里混着 WB 的图片 / 文件 / 技能引用，例如（v1.0.57 真实会话实测全文）：
+#   "@image#1:e3dff…png @image#2:Clipboard_Screenshot.png … @image#9:… 帮我把这些图片内容整理成md文档 @skill:ardot-design-core"
+# 不抠掉的话，`user_input_title` 会把 `@image#1:…png` 当真话截 44 字当卡片标题，
+# 面板上就是一行机器话（用户明确否掉过这类文案）。
+# 通用形态：`@image#1:xxx.png` / `@file#2:…` / `@skill:ardot-design-core`（后一种没序号）
+_REF_TOKENS = re.compile(r"@[a-z_]+(?:#[0-9]+)?:[^\s@]+", re.I)
+
+
+def _strip_refs(s):
+    """抠掉 `@image#1:xxx.png` / `@skill:xxx` 这类引用标记，剩下才是用户真话。"""
+    return _REF_TOKENS.sub(" ", str(s or "")).strip()
+
+
+def last_user_input(session_id):
+    """读本会话 transcript 最近一条用户消息 → `(文本, {中文类别: 数量})`。
+
+    纯图片 / 纯附件提交时 WB **不会派发 UserPromptSubmit hook**（实测 codebuddy
+    bundle 里 `if(!el) return;`，el 为空文本 → 整条 hook 跳过），所以 hook 侧拿不到
+    prompt；只能回 transcript 数附件，用于把卡片标题写成人话。
+    长会话 jsonl 能到几十 MB，先读尾部、找不到再从头部捞一小段。
+    """
+    path = transcript_path(session_id)
+    if not path:
+        return "", {}
+    blocks = _user_blocks(path, from_end=True)
+    if not blocks:
+        blocks = _user_blocks(path, from_end=False, read_mb=4)
+    text, counts = "", {}
+    for b in blocks:
+        if b.get("type") in ("input_text", "text"):
+            raw = b.get("text")
+            if isinstance(raw, str) and _strip_injection(raw).strip():
+                # 先剥注入块，再抠掉 @image#N / @skill: 引用标记，剩下的才是真话
+                text = _strip_refs(_strip_injection(raw))
+            continue
+        k = classify_attachment(b)
+        if k:
+            counts[k] = counts.get(k, 0) + 1
+    return text, counts
+
+
+def describe_attachments(counts, limit=44):
+    """`{图片:3, 视频:1, 文件:2}` → `用户发送了 3 张图片、1 个视频、2 个文件`。
+
+    类别多（超过 limit 装不下）时**不硬截断**成半句话，而压缩成
+    `用户发送了 3 张图片（音频 1、视频 2、文件 4…）`：主句留数量最多的那类，
+    其余进括号，装不下就往回砍类并补「…」。这条文案是纯附件提交的卡片标题
+    （v1.0.57 用户明确否掉过「（未识别到文本输入）」这种机器话）。
+    """
+    if not counts:
+        return ""
+    names = [n for n in ("图片", "音频", "视频", "文件")
+             if int(counts.get(n) or 0) > 0]
+    names += [n for n in counts                      # 未来新增的类别（如「文本」）也进括号
+              if n not in names and int(counts.get(n) or 0) > 0]
+    parts = ["%d %s%s" % (int(counts.get(n) or 0), _ATTACH_UNIT.get(n, "个"), n)
+             for n in names]
+    if not parts:
+        return ""
+    head, rest = parts[0], parts[1:]
+    if not rest:
+        s = "用户发送了 " + head
+        return s[:limit - 1] + "…" if len(s) > limit else s
+    # 括号里的类别从「全列」开始往回砍，砍到整句装得下为止（v1.0.57 实测修的
+    # 两个坑：① 原来只留前 3 类就必补「…」，4 类时其实根本不需要；② 原来不按
+    # limit 判断，超长会硬截成半句话）。砍到只剩一类还超长，退回「主句 + 省略号」。
+    for keep in range(len(rest), 0, -1):
+        inner = "、".join(rest[:keep]) + ("…" if keep < len(rest) else "")
+        s = "用户发送了 %s（%s）" % (head, inner)
+        if len(s) <= limit:
+            return s
+    s = "用户发送了 %s（…）" % head
+    return s[:limit - 1] + "…" if len(s) > limit else s
+
+
+def user_input_title(session_id, text=None, limit=44, fallback="会话执行中"):
+    """卡片标题：`真话优先` → `用户发送了 N 张图片、M 个文件` → `fallback`。
+
+    优先级（v1.0.57 实测校准）：**用户真话 > 附件统计**。图文混发时（比如「帮我看看这张图」
+    + 1 张图）标题就该是那句真话，把附件统计顶上去等于吞掉了用户的指令；只有**整条提交
+    没有任何真话**（纯图片 / 纯音频 / 纯文件）才退化成人话附件统计。
+    hook_prompt 传 fallback="会话执行中"，hook_auto_step 传默认同值
+    （保底：普通工具调用补建卡 / 连 transcript 都读不到时不该顶着用户标题）。
+    """
+    t = (text or "").strip()
+    counts = {}
+    if not t:
+        try:
+            t, counts = last_user_input(session_id)
+        except Exception:
+            t, counts = "", {}
+    t = (t or "").strip()
+    if t:
+        return clean_title(t, limit)
+    return describe_attachments(counts, limit) or fallback
+
+
+def last_assistant_text(session_id, tail_bytes=6 * 1024 * 1024, max_lines=4000):
+    """读 transcript **末尾最近一条助手正文** → `(行 id, 文本)`；抓不到返回 `(None, "")`。
+
+    transcript 形态（实测）：每行一个 JSON，`type:"message"` / `role:"assistant"` /
+    `content:[{type:"output_text", text:"…"}]`；助手正文一条消息可能分成多个 output_text
+    块。长会话的 jsonl 能到几十 MB，所以只读**尾部** tail_bytes、且最多解析 max_lines 行，
+    从后往前找到第一条含 output_text 的 assistant 行即最近一条（此时它多半还没写完整，
+    但面板要的就是"最新的那句"）。
+    """
+    f = transcript_path(session_id)
+    if not f:
+        return (None, "")
+    try:
+        size = os.path.getsize(f)
+        with open(f, "rb") as fh:
+            fh.seek(max(0, size - int(tail_bytes)))
+            raw = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return (None, "")
+    try:
+        lines = raw.splitlines()[-int(max_lines):]
+    except Exception:
+        lines = []
+    for ln in reversed(lines):
+        if '"assistant"' not in ln or '"output_text"' not in ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        if (o.get("role") or "") != "assistant":
+            continue
+        parts = []
+        for b in (o.get("content") or []):
+            if isinstance(b, dict) and b.get("type") == "output_text":
+                t = (b.get("text") or "").strip()
+                if t:
+                    parts.append(t)
+        if parts:
+            return (o.get("id"), "\n".join(parts).strip())
+    return (None, "")
+
+
+# ───────────────────────────────────────────────「会话流」逐条还原（v1.0.60）
+# 用户 2026-10-04 追加要求：「会话内容」不能只有最后那段回复，**执行过程中会话里出现的
+# 中间内容**也要逐条收进去。transcript 里这活儿有三个落点（实测，见
+# `_probe_transcript_shape.py` / `_probe_line_json.py`）：
+#   · `type:"message"` + `role:"assistant"` + `content:[{type:"output_text", text}]`
+#     → 助手正文（一句一条，实测一行只有一个 output_text 块）
+#   · `type:"reasoning"` + `rawContent:[{type:"reasoning_text", text}]` → 思考块
+#   · `type:"function_call"` + `name` + `arguments`（**JSON 字符串**，要 loads）→ 工具调用
+# 默认收**全会话流**（v1.0.62，用户 2026-10-04 圈着会话窗的执行项图标定的口径）：
+# 「会话内容」要的是"会话里显示了什么"——不只正文，**修改/读取/编辑/思考/测试这些执行项也逐条进**，
+# 每条带会话窗同款默认图标（✏️ 改 / 👁 看 / ⌨️ 跑 / 🔍 搜，深度思考没图标 → 配 💭）。
+# 早期默认只收 text（工具人话版步骤条已列、思考交给活体指示），用户明确要"收全"后改掉；
+# 嫌吵可收窄：`LIVE_PROGRESS_STREAM_KINDS=text`（思考块改回活体指示、工具行只进步骤条）。
+STREAM_KINDS = [k.strip() for k in
+                (os.environ.get("LIVE_PROGRESS_STREAM_KINDS") or "text,think,tool").split(",")
+                if k.strip()]
+STREAM_LIMIT = int(os.environ.get("LIVE_PROGRESS_STREAM_LIMIT") or 40)   # 一轮最多看多少条
+STREAM_FIRST = int(os.environ.get("LIVE_PROGRESS_STREAM_FIRST") or 12)   # 首次同步补发条数
+STREAM_RESYNC = 8                       # 游标丢失（掉出窗口）时的保守补发条数
+TOOL_ICON = "\u2699\ufe0f"              # ⚙️ 仅 CLI 文本输出兜底用（面板走 app_icons 单色 SVG）
+THINK_ROW = "正在思考…"                 # **活体**状态行（面板末尾临时挂，不落盘；图标由 ic=deep 给）
+THINK_HIST_ROW = "深度思考"             # 思考块的**历史**行（落卡；对齐会话窗的「深度思考」标签）
+
+
+def _stream_item(o):
+    """一行 transcript JSON → 0~1 个流项 `(mid, kind, payload)`；不是流项返回 None。"""
+    t = str(o.get("type") or "")
+    if t == "message":
+        if (o.get("role") or "") != "assistant":
+            return None
+        parts = [str(b.get("text") or "").strip() for b in (o.get("content") or [])
+                 if isinstance(b, dict) and b.get("type") == "output_text"]
+        txt = "\n".join(p for p in parts if p).strip()
+        return (o.get("id"), "text", txt) if txt else None
+    if t == "reasoning":
+        return (o.get("id"), "think", "")
+    if t == "function_call":
+        args = o.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"_raw": args}
+        if not isinstance(args, dict):
+            args = {}
+        return (o.get("id"), "tool", {"name": str(o.get("name") or ""), "input": args})
+    return None
+
+
+def recent_stream(session_id, tail_bytes=6 * 1024 * 1024, max_lines=6000,
+                  turn_only=True, limit=None, kinds=None):
+    """读 transcript 尾部 → **本轮**的会话流 `[(mid, kind, payload), …]`（按行序，旧→新）。
+
+    `turn_only=True` 时只从**最后一条 user 消息**往后取 —— 「会话内容」要的是"当前这轮
+    在会话里显示了什么"，不是整个会话的考古（长会话 transcript 能到 55MB）。
+    `kinds=None` → 不过滤（含 think / tool，面板要拿它判断"此刻在不在思考"）；
+    连续多个思考块并成一条（模型常连续思考好几段，逐块报会把卡片刷满）。
+    ⚠️ `limit` 是**对本函数返回值**的截断，缺省不截断 —— 调用方要想"只要最近 N 条正文"，
+    必须**先按 kind 过滤再取尾部**（`sync_stream` 就是这么做的）。早期版本把"先截 40 条
+    再过滤"写在了这里，结果一轮里工具调用一多（实测 40 条全是 think/tool），
+    中间的助手正文**全被截掉** → 卡片「会话内容」空着，正是用户报的那个症状。
+    """
+    f = transcript_path(session_id)
+    if not f:
+        return []
+    try:
+        size = os.path.getsize(f)
+        with open(f, "rb") as fh:
+            fh.seek(max(0, size - int(tail_bytes)))
+            raw = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    try:
+        lines = raw.splitlines()[-int(max_lines):]
+    except Exception:
+        return []
+    start = 0
+    if turn_only:
+        for i in range(len(lines) - 1, -1, -1):
+            ln = lines[i]
+            if '"user"' not in ln:          # 便宜的预筛，别对每行都 json.loads
+                continue
+            try:
+                o = json.loads(ln)
+            except Exception:
+                continue
+            if o.get("type") == "message" and (o.get("role") or "") == "user":
+                start = i + 1
+                break
+    items, prev_kind = [], None
+    for ln in lines[start:]:
+        if not ln.strip():
+            continue
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        it = _stream_item(o)
+        if not it or (kinds is not None and it[1] not in kinds):
+            continue
+        if it[1] == "think" and prev_kind == "think":
+            prev_kind = "think"
+            continue                        # 连续思考 → 一条
+        prev_kind = it[1]
+        items.append(it)
+    return items[-int(limit):] if limit else items
+
+
+def stream_cell(kind, payload):
+    """流项 → `(人话文本, 图标key)`。图标 key 交给面板渲染 app_icons 的单色 SVG。"""
+    if kind == "tool":
+        name = (payload or {}).get("name") or ""
+        tinput = (payload or {}).get("input") or {}
+        txt, ic = "", "tool"
+        if _H is not None:
+            try:
+                txt = _H.plain_tool(name, tinput)
+                ic = _H.tool_icon_key(name, txt)
+            except Exception:
+                txt, ic = "", "tool"
+        if not txt:
+            txt = name or "工具调用"
+        return txt, ic
+    if kind == "think":
+        return THINK_HIST_ROW, "deep"
+    txt = _human(payload, limit=REPLY_MAXLEN)
+    ic = ""
+    if _H is not None:
+        try:
+            ic = _H.icon_key(txt)
+        except Exception:
+            ic = ""
+    return txt, ic
+
+
+def stream_row(kind, payload):
+    """流项 → 面板「会话内容」区的一行**文本**（图标走 `stream_cell` 的 key，不拼进正文）。"""
+    return stream_cell(kind, payload)[0]
+
+
+def _blank_job(jid, now):
+    """补建卡片的默认字段（与 `update()` 的补建口径一致，避免面板解析炸）。"""
+    return {"id": jid, "title": jid, "status": "running", "done": 0, "total": None,
+            "unit": "项", "message": "", "source": "script", "session_id": None,
+            "cwd": os.getcwd(), "cmd": None, "log_file": None, "log": [], "reply": [],
+            "planned_sec": None,
+            "started_at": now, "updated_at": now, "ended_at": None}
+
+
+def sync_stream(session_id, job_id=None, limit=None, ts=None):
+    """把 transcript 里**本轮**的会话流**增量**同步到面板「会话内容」区（v1.0.60）。
+
+    - 入卡的只有 `STREAM_KINDS` 里的类型（v1.0.62 起默认 text,think,tool = 收全会话流）；
+    - 除此之外顺手记一个 `stream_kind`（**此刻**最新一条流项的类型）——面板拿它决定
+      卡片末尾要不要临时挂一行 `💭 正在思考…`（活体行；思考块落卡的是「💭 深度思考」历史行）；
+    - 增量游标 = `job["reply_mid"]`（上次同步到的**正文**项 id）：只投递它之后的新项；
+    - 游标丢失（首次 / 掉出窗口）时保守地只补最近几条，绝不把一整轮刷进卡片；
+    - 返回本次新增条数。失败一律吞掉（hook / 面板轮询都不该被它拖累）。
+    """
+    sid = str(session_id or "")
+    jid = job_id or (("sess-" + sid) if sid else None)
+    if not jid or not sid:
+        return 0
+    try:
+        # 不过滤、不截断地读一遍窗口：既要按 kinds 挑出正文（**先过滤后截尾**，
+        # 否则一轮里 tool/think 一多就会把正文挤出窗口），也要知道**最新那条**是什么类型
+        items_all = recent_stream(sid)
+    except Exception:
+        return 0
+    if not items_all:
+        return 0
+    head = items_all[-1][1]
+    items = [it for it in items_all if it[1] in STREAM_KINDS][-int(limit or STREAM_LIMIT):]
+    try:
+        cells = {m: stream_cell(k, p) for m, k, p in items}
+    except Exception:
+        cells = {}
+    now = float(ts) if ts else time.time()
+    added = 0
+    try:
+        with _lock():
+            jobs = load_jobs()
+            j = jobs.get(jid)
+            if j is None:
+                j = _blank_job(jid, now)
+                jobs[jid] = j
+            seq = [x for x in (j.get("reply") or []) if isinstance(x, dict)]
+            have = set(str(x.get("mid")) for x in seq)
+            cur = j.get("reply_mid")
+            pos = -1
+            if cur:
+                for i, it in enumerate(items):
+                    if it[0] == cur:
+                        pos = i
+            if not items:
+                start = 0                       # 本轮还没有正文 → 不投递，只更新 stream_kind
+            elif pos >= 0:
+                start = pos + 1
+            elif cur:
+                start = max(0, len(items) - STREAM_RESYNC)
+            else:
+                start = max(0, len(items) - STREAM_FIRST)
+            for i in range(start, len(items)):
+                m = items[i][0]
+                cell = cells.get(m) or ("", "")
+                txt, ic = cell[0], cell[1]
+                if not txt or (m and str(m) in have):
+                    continue                    # 空文本 / 同一 transcript 行只上一次
+                seq.append({"t": now, "text": txt, "mid": m, "ic": ic})
+                if m:
+                    have.add(str(m))
+                added += 1
+            if items:
+                j["reply_mid"] = items[-1][0] or cur
+                del seq[:-MAX_REPLY]
+                j["reply"] = seq
+                j["reply_at"] = now
+            if j.get("stream_kind") != head:
+                j["stream_kind"] = head             # 面板据此挂「💭 正在思考…」
+            j["updated_at"] = now
+            _safe_save(jobs)
+    except Exception:
+        return 0
+    return added
+
+
+def reply(text, job_id=None, session_id=None, mid=None, ts=None, ic=None):
+    """把一段「会话内容」挂到任务卡的 会话内容区（面板独立分区，与日志分开）。
+
+    - `job_id` 缺省时按 `sess-<session_id>` 写当前会话卡；
+    - 文本经 `humanize.plain_text()` 转成**单行人话**（压换行 / 去 markdown / 技术名词中文化），
+      再截断到 REPLY_MAXLEN —— 面板「会话内容」区是**一行一条**（超宽走中段省略）；
+    - `ic` = 图标 key（面板据此渲染 app_icons 的单色 SVG）；缺省按文本类型猜
+      （`humanize.icon_key`）——**工具/思考行必须显式传**（stream_cell 给的 key 更准）；
+    - 最多保留 MAX_REPLY 条（**不做累计计数**，会话内容不是日志）；
+    - `mid` 用于去重：Stop hook 每回合都跑，同一条助手消息（transcript 行 id）只写一次；
+      比对的是**整个列表**里有没有该 mid，而不只是最后一条 —— 否则中间轮次被覆盖后
+      同一条会重复进来（早期只比 `reply_mid` 的写法在多条保留后就会漏判）；
+    - 卡片不存在时自动补建（沿用 update() 的补建字段，避免面板解析炸）。
+    返回 job dict；无文本/无目标 id 返回 None。
+    """
+    text = _human(text, limit=REPLY_MAXLEN)
+    if not text:
+        return None
+    if ic is None:
+        ic = ""
+        if _H is not None:
+            try:
+                ic = _H.icon_key(text)
+            except Exception:
+                ic = ""
+    jid = job_id or (("sess-" + str(session_id)) if session_id else None)
+    if not jid:
+        return None
+    now = float(ts) if ts else time.time()
+    with _lock():
+        jobs = load_jobs()
+        j = jobs.get(jid)
+        if j is None:
+            j = _blank_job(jid, now)
+            jobs[jid] = j
+        seq = [x for x in (j.get("reply") or []) if isinstance(x, dict)]
+        if mid and any(x.get("mid") == mid for x in seq):
+            return j                      # 同一条助手消息，已经上面板了
+        seq.append({"t": now, "text": text, "mid": mid, "ic": ic})
+        del seq[:-MAX_REPLY]
+        j["reply"] = seq
+        j["reply_at"] = now
+        if mid:
+            j["reply_mid"] = mid          # 兼容旧字段（面板 / 老数据仍在读）
+        j["updated_at"] = now
+        _safe_save(jobs)
+        return j
+
+
 # ---------------------------------------------------------------- WB 权威状态同步
-WB_DB = os.path.join(os.path.expanduser("~"), ".workbuddy", "workbuddy.db")
+WB_DB = os.path.join(home_dir(), ".workbuddy", "workbuddy.db")
 _WB_SYNC_LAST = 0.0
 
 # workbuddy.db sessions.status → 会话卡收尾动作；working = 正在执行，保持 running
@@ -905,13 +1520,17 @@ class Progress(object):
         return False
 
 
-def append_auto_step(job_id, label, complete=True):
+def append_auto_step(job_id, label, complete=True, log_text=None):
     """自动映射：把一次工具调用追加为会话卡的一个步骤。
 
     complete=True（PostToolUse，工具已完成）→ 该步即 ✓；若 PreToolUse 已先插入了
     同名的「进行中」步（current_step 正指向它），则只把它推进为完成、不重复追加（去重）。
     complete=False（PreToolUse，工具进行中）→ 插入一步并标记 🔄 进行中。
-    限长 MAX_AUTO_STEPS 步，被挤掉的旧步骤仍在日志里。"""
+    限长 MAX_AUTO_STEPS 步，被挤掉的旧步骤仍在日志里。
+
+    `log_text`：**日志行**用的文案（v1.0.59）。步骤条走人话、日志要留原始命令，
+    两者文案不同，所以分开传；不传就沿用 `label`（老调用方行为不变）。
+    """
     MAX_AUTO_STEPS = 12
     with _lock():
         jobs = load_jobs()
@@ -931,7 +1550,7 @@ def append_auto_step(job_id, label, complete=True):
             # 完成后该步即 ✓（current=len，所有步 i<cur）；进行中该步🔄（current=len-1）
             j["current_step"] = len(steps) if complete else len(steps) - 1
         j["manual_steps"] = j.get("manual_steps", False)
-        _log_push(j, ["%s  %s" % (time.strftime("%H:%M:%S"), label)])
+        _log_push(j, ["%s  %s" % (time.strftime("%H:%M:%S"), log_text or label)])
         j["updated_at"] = time.time()
         _safe_save(jobs)
     return j
@@ -1000,6 +1619,23 @@ def _cli():
     p = sub.add_parser("log", help="只追加一行日志")
     p.add_argument("--id", required=True)
     p.add_argument("--msg", required=True)
+
+    p = sub.add_parser("reply",
+                       help="写一段「会话内容」到面板 会话内容区（给预览区直接读的结论/说明）")
+    p.add_argument("--text", required=True, help="AI 说的话（超长自动截断到 %d 字）" % REPLY_MAXLEN)
+    p.add_argument("--id", default=None, help="目标卡 id；缺省按 --session 写 sess-<session> 会话卡")
+    p.add_argument("--session", default=None, help="会话 id（与 --id 二选一）")
+
+    p = sub.add_parser("stream",
+                       help="（排障）看本会话「会话内容」区将收到哪几行（--sync 则真投递）")
+    p.add_argument("--session", required=True, help="会话 id")
+    p.add_argument("--id", default=None, help="投递目标卡 id；缺省 sess-<session>")
+    p.add_argument("--limit", type=int, default=STREAM_LIMIT,
+                   help="最多看几条（默认 %d；0 = 全部）" % STREAM_LIMIT)
+    p.add_argument("--sync", action="store_true", help="真投递到卡片（默认只看不写）")
+    p.add_argument("--backfill", type=int, default=0, metavar="N",
+                   help="补历史：把整会话最近 N 条助手正文补进「会话内容」区（卡重建/跨回合用）")
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("finish", help="标记完成/失败")
     p.add_argument("--id", required=True)
@@ -1074,6 +1710,48 @@ def _cli():
         update(a.id, done=cur + a.n, message=a.msg)
     elif a.cmd == "log":
         update(a.id, log_line="%s  %s" % (time.strftime("%H:%M:%S"), a.msg))
+    elif a.cmd == "reply":
+        j = reply(a.text, job_id=a.id, session_id=a.session)
+        print(json.dumps({"id": (j or {}).get("id"), "reply": len((j or {}).get("reply") or [])},
+                         ensure_ascii=False))
+    elif a.cmd == "stream":
+        # 排障用：直接看「会话内容」区**将会**收到哪些行（默认只看不写）
+        all_items = recent_stream(a.session)                  # 窗口内全部类型
+        head = all_items[-1][1] if all_items else None
+        in_card = [it for it in all_items if it[1] in STREAM_KINDS]
+        lim = int(a.limit or 0)
+        shown = in_card[-lim:] if lim else in_card
+        rows = [{"mid": m, "kind": k, "text": c[0], "ic": c[1]}
+                for m, k, p, c in
+                ((m, k, p, stream_cell(k, p)) for m, k, p in shown)]
+        if a.json:
+            print(json.dumps({"kinds": STREAM_KINDS, "head": head,
+                              "window_items": len(all_items), "in_card": len(in_card),
+                              "items": rows}, ensure_ascii=False, indent=1))
+        else:
+            from collections import Counter
+            cnt = Counter(k for _m, k, _p in all_items)
+            print("入卡类型 = %s；此刻最新一条 = %s；窗口内 %d 条（%s）/ 会入卡 %d 条"
+                  % (",".join(STREAM_KINDS), head, len(all_items),
+                     " ".join("%s=%d" % (k, cnt[k]) for k in sorted(cnt)), len(in_card)))
+            for r in rows:
+                print("  ✓ [%s][%s] %s" % (r["kind"], r["ic"], r["text"]))
+            if not rows:
+                print("(本轮还没有可入卡的助手正文)")
+        if a.backfill:
+            # 补历史：卡刚被重建 / 换了回合，把**整会话**最近 N 条助手正文补进「会话内容」区
+            prev = recent_stream(a.session, turn_only=False, kinds=list(STREAM_KINDS))[
+                -int(a.backfill):]
+            bjid = a.id or ("sess-" + a.session)
+            before = len((load_jobs().get(bjid) or {}).get("reply") or [])
+            for m, k, p in prev:
+                t, kic = stream_cell(k, p)
+                if t:
+                    reply(t, job_id=bjid, mid=m, ic=kic)
+            after = len((load_jobs().get(bjid) or {}).get("reply") or [])
+            print(json.dumps({"backfilled": after - before}, ensure_ascii=False))
+        if a.sync:
+            print(json.dumps({"synced": sync_stream(a.session, a.id)}, ensure_ascii=False))
     elif a.cmd == "finish":
         j = finish(a.id, ok=not a.failed, message=a.msg)
         print(json.dumps({"id": j["id"], "status": j["status"]}, ensure_ascii=False))

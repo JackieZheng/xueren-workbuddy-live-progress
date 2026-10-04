@@ -56,6 +56,28 @@ def _running_bg_of(jobs, session_id):
             and (v.get("session_id") or "") == (session_id or "")]
 
 
+def _auto_reply(session_id, jid):
+    """回合结束 → 把助手本轮在会话里出现过的内容**逐条**抓进面板「会话内容」区。
+
+    v1.0.55 只抓「最后一段话」；v1.0.60 起改为**整轮会话流**（用户 2026-10-04：
+    「不只包括回复的内容，也包括执行时显示在会话里的内容」）——
+    助手一条条说的话（含中间的进度播报、结论）+ 思考块，都在 `progress.sync_stream` 里
+    按 transcript 行序增量投递，游标 `reply_mid` 保证同一行只上一次。
+
+    - 读 transcript 是几十 MB 文件的尾部读，失败/超时一律吞掉，绝不影响会话；
+    - 想彻底关掉这条自动投递：环境变量 `LIVE_PROGRESS_REPLY=0`。
+    """
+    if not session_id or os.environ.get("LIVE_PROGRESS_REPLY") == "0":
+        return False
+    try:
+        n = P.sync_stream(session_id, jid)
+        if n:
+            sys.stderr.write("[hook_stop] 会话内容已上面板（本轮新增 %d 条）\n" % n)
+        return bool(n)
+    except Exception:
+        return False
+
+
 def handle_stop(data):
     session_id = data.get("session_id") or ""
     jid = "sess-" + (session_id or "default")
@@ -92,6 +114,7 @@ def handle_stop(data):
 
     # 已打开面板 / 纯问答：本轮正常结束，但会话仍在继续 → 卡片保持 running，
     # 交给 SessionEnd（会话终止）或显式 finish-session 收尾。
+    _auto_reply(session_id, jid)             # 会话内容上面板（失败不影响下面这份结论）
     return _ok()
 
 

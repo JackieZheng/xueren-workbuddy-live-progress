@@ -7,7 +7,7 @@ slug: xueren-workbuddy-live-progress
 displayName: 雪人老师·[WorkBuddy]任务执行进度·实时面板
 summary: 完整任务执行过程（前台+后台）实时看板：从接到命令→执行中→结束，时间线/步骤进度条/进度环/速率/ETA/日志；前台任务每个工具调用默认自动映射成步骤，无需手动接入。
 description_en: A universal live progress panel for background tasks in a session.
-version: 1.0.53
+version: 1.0.67
 author: 雪人
 license: MIT
 allowed-tools: ""
@@ -28,9 +28,62 @@ description_zh: WorkBuddy 会话任务通用「任务执行进度·实时面板�
 
 一次用户请求从「接到命令」到「结束」的完整执行过程，实时看板在 `http://127.0.0.1:8791/`——**前台与后台任务都覆盖**，不限于后台 Bash。
 
-每张卡四件事：📥 接到命令 → ▶ 开始执行 → ⏱ 已运行（实时计时）；步骤进度条（✓ 已完成 / 🔄 进行中 / ⏳ 待办）；量化进度（进度环 + 已完成/剩余 + 速率/预计完成）；日志（任何无法量化的过程一律进日志，实时滚动）。
+每张卡五件事：📥 接到命令 → ▶ 开始执行 → ⏱ 已运行（实时计时）；步骤进度条（✓ 已完成 / 🔄 进行中 / ⏳ 待办）；量化进度（进度环 + 已完成/剩余 + 速率/预计完成）；**会话内容**（助手说过的话 + 执行项，一行一条）；日志（任何无法量化的过程一律进日志，实时滚动）。
+
+## 会话内容（v1.0.55 建区，曾名「AI 输出」；**v1.0.64 改名**——v1.0.62 起已收全会话流，旧名名不副实）
+
+面板此前只有「机器日志」，看不到助手自己说了什么——助手正文不经工具、没有现成 hook 事件，所以走**双通道**：
+
+- **自动（默认开）**：读本会话 transcript `~/.workbuddy/projects/<工作区>/<session_id>.jsonl`，
+  把**本轮**（最后一条用户消息之后）助手在会话里出现过的话**逐条**同步进当前会话卡的 **会话内容**区：
+  - **回合进行中就同步**（v1.0.59）：transcript 是边说边写的，会话卡每 3 秒做一次尾部读（**文件没长就不读**），
+    不用等回合结束；回合结束由 Stop hook 补一次收尾。
+  - **增量 + 去重**：游标 `reply_mid`（transcript 行 id）保证同一条只上一次；首次补最近 12 条、
+    游标丢失补最近 8 条，绝不把一整轮刷屏。「不看整个会话考古」——只取当前这一轮。
+  - **收全会话流（v1.0.62，默认）**：不只正文——**修改/读取/编辑/思考/测试这些执行项也逐条进**，
+    每条带会话窗同款默认图标（✏️ 改 / 👁 看 / ⌨️ 跑 / 🔍 搜 / 💭 深度思考）。
+    嫌吵可收窄：`LIVE_PROGRESS_STREAM_KINDS=text`（思考改回活体指示、工具行只进步骤条；
+    改完面板 10 秒内热更新，`/api/jobs` 顶层 `stream_kinds` 能看到**进程内实际生效**的值）。
+  - **思考块两种形态别混**：历史行 =「💭 深度思考」（落卡，对齐会话窗的「深度思考」标签）；
+    活体行 =「💭 正在思考…」（`stream_kind=think` 且末行不是思考历史行时，面板末尾临时挂、不落盘）。
+  - 只在文件尾部读（默认 6MB / 最多解析 6000 行），读不到就静默跳过，绝不影响会话。想彻底关掉：`LIVE_PROGRESS_REPLY=0`。
+- **主动**：多回合长任务里想先在面板给个说法，直接 `python scripts/progress.py reply --text "已扫完 1200 个文件，正在预筛…"`（不带 `--id` 时按 `--session` 写 `sess-<session_id>`）。脚本内嵌用 `progress.reply("…", job_id="sess-xxx")`。
+- **排障**：`python scripts/progress.py stream --session <sid>` 看「窗口内几条 / 会入卡几条 / 具体哪几行」（默认只看不写）；
+  加 `--sync` 真投递；`--backfill N` 把**整会话**最近 N 条正文补进卡（卡被重建或刚跨回合、看着空时用）；
+  `python scripts/_debug_reset_reply.py <sid>` 一键「清空 + 按当前口径重同步」。
+
+展示约定：卡片里 **会话内容区（定高 80px = 4 行，在推进曲线与日志之间）**一行一条、超宽走中段省略
+（全文挂 `title` 悬停）、超出可滚动，只取尾部若干条渲染；空态显示「本轮会话还没内容 · 正文与执行项会自动同步到这里」
+——**占位也要占**，所有卡片因此仍然等高。会话内容与日志互不干扰：它不计入日志行数，也不写进 `log` 列表。
+
+**人话化与图标**（`scripts/humanize.py`，总开关 `LIVE_PROGRESS_HUMANIZE=0`）：正文压成单行、
+去 markdown、技术名词中文化、行内命令讲通俗说法，并把英文引导句剥掉只留中文（`Now let me … — 真正的那句中文`）。
+每条前面一个**类型图标**：正文自带图标就**一个字不动**（`ic` 留空），没有才按类型补一个；
+图标**一律用应用自带的单色 SVG**（v1.0.63，用户口径：不是"同款"，是**原来的图标**，自定义的也必须同样单色）
+——`scripts/app_icons.py`（从 `app.asar` 的 `wb-components/Icon/icons/*.tsx` **原样照搬**，勿手改，
+重抽用 `_probe_gen_app_icons.py`），面板按行的 `ic` key 渲染 `<svg viewBox fill>`（`currentColor` 随文字色）：
+- **执行项**（key 归属逐字照搬会话窗 `toolIconEntries`，`humanize.tool_icon_key`）：
+  `read` 眼睛 / `edit` 铅笔 / `run` 终端 / `search` 放大镜 / `web` 地球 / `skill` / `plan` / `agent` / `image` … 兜底 `tool` 扳手；
+- **正文**（`humanize.icon_key`）：`ok` 绿圈勾 / `fail` ✕ / `warn` 橙三角（这三个是应用状态图标、原色）
+  / `data` / `search` / `pin` / `idea` / `route` / `loading` / 兜底 `chat` 气泡；
+- **思考**：`deep`（应用自己的 WbDeepIcon）；历史行「深度思考」、活体行「正在思考…」都走它。
+⚠️ 日志**不做**人话化（保留原始工具名与原始命令，给专业人员排障用）。
+
+**步骤条 = 会话内容行，逐字一致**（v1.0.66）：两处都调 `humanize.plain_tool()`（`<前缀>: <人话内容>`，
+前缀沿用步骤条既有的中文前缀），**同一件事在卡里不许有两种措辞**；改文案只改 humanize 一处
+（契约由 `_test_humanize.py` 的「步骤条 == 会话内容行」断言锁住）。
+**元信息「在做什么: …」的分流**（v1.0.66，用户报「接到命令的人话误判」）：会话卡的 `cmd` 存的是
+**用户原话**（hook_prompt 已剥掉 WB 注入块），`plain_command` 兜底前先判「像不像命令」
+（`humanize.looks_like_command`，以可执行名开头才算）——是命令但规则不认 → 只报**执行程序名**
+（`运行一段 Python 代码` / `运行命令 foo.exe`，不再把整条命令首尾各截一半）；是自然语言原话 →
+**只截头 60 字**原样展示（不做中段省略）；`<task-notification>` 这类注入 → 「收到一条系统通知」。
+历史卡片里的原始注入由 `live_panel._cmd_fields` 再剥一层。
 
 ## 默认自动映射
+
+**计时从「用户按下发送」那刻起**（v1.0.56）：`UserPromptSubmit` hook 一收到提交就立刻建卡钉锚点（实测建卡 6~7ms、整条 hook 60~130ms，远低于 15s 时限），面板「📥 接到命令 / ▶ 开始执行 / ⏱ 已运行」全从这一刻算起，**不是 AI 开工才开始走**；纯图片、空文本、只有附件的提交也照样建卡，防止退化成「AI 开始处理才计时」。面板拉起改走后台线程，冷启动再慢也不会拖住这条 hook。
+
+**没有文本时卡片写人话**（v1.0.57）：整条提交没有一句用户真话（纯图片 / 纯音频 / 纯文件 / 只有引用标记）时，标题自动落成附件统计，例如`用户发送了 9 张图片`、`用户发送了 3 张图片（1 个音频、1 个视频、2 个文件）`；类别多到装不下会往回砍类并补「…」，绝不硬截断成半句话。反过来，**图文混发时永远是那句真话优先**，附件统计只顶在「一条真话都没有」的场合。
 
 对每个用户请求自动建一张 `sess-<session_id>` 会话卡；你执行的**每个工具调用默认自动变成它的一个步骤**——Bash / Write / Edit / Agent / TaskOutput 等**主干工具成步**，Read / Grep / Glob / WebFetch / WebSearch 等**轻量工具只进日志**。想自己规划步骤：`begin --id sess-<session_id> --steps "准备,处理,收尾"` 接管；一旦接管（`manual_steps=True`）自动映射退居日志，绝不打乱你的步骤条。`UserPromptSubmit` 没派发时首个工具调用也会兜底建卡。
 
@@ -114,9 +167,11 @@ python scripts/progress.py list --running   # 验收：本轮是否还有卡在�
 - 注册表 `~/.workbuddy/live-progress/jobs.json`（`LIVE_PROGRESS_DIR` 覆盖）；端口 8791（`LIVE_PROGRESS_PORT` 覆盖）；上限 40 条（按 `updated_at` 保留最新）。
 - **每个任务保留的日志行数默认 40**（`progress.py` 的 `MAX_LOG`）：写满后**直接丢弃旧行**，所以长会话的早期日志不会留在注册表里 —— 卡片上「日志 N 行」到 40 就封顶。
   要留住更多历史：`LIVE_PROGRESS_MAX_LOG=300`（环境变量，取不到值即回退 40）。⚠️ 面板日志区**只渲染最后 10 行**（定高滚动框），放大上限并不会让可见行数变多。
+- **会话卡按回合清零**（v1.0.65）：同一会话提交新命令 = 新回合——「会话内容」「日志（尾部）」「步骤」「计时锚点」全部**清零重开**（会话内容自 v1.0.60 起就是按回合的，v1.0.65 补齐日志）；「本轮 N 行 · 累计 M 行」里的**累计**计数保留，只作 tooltip 参考。脚本卡（`begin`，不带 round_reset）不受影响，日志照旧保留。
 - hooks 安装 `python scripts/install_hooks.py`（幂等、自动备份 settings.json；`--status` / `--uninstall`）。
-- **改代码即生效**：面板热更新——`live_panel.py` / `progress.py` 一改，运行中的面板 3 秒内用同参数重启（前端 build 变了自动 reload），通常无需手动 restart；自动重启失败（端口被占）时 `panel_ctl.py upgrade` → `restart` → 换端口三选一。
-- `panel_ctl.py status` 给出「运行中 build / 磁盘 build」，不一致即改动未生效；热更新没成功时 hook 也会把提醒带进会话上下文。
+- **改代码即生效**：面板热更新——`scripts/` 下**任何运行期 `.py` 一改**（`live_panel.py` / `progress.py` / `humanize.py` …，即**非下划线开头**的那些；`_test_` / `_probe_` / `_debug_` 等开发级脚本改动**不触发**，改测试不该重启面板），运行中的面板 10 秒内用同参数重启（前端 build 变了自动 reload），通常无需手动 restart。
+  ⚠️ **唯一例外**：这一批改的**正是指纹函数本身**（或面板已在跑的是旧逻辑）时，需手动 `panel_ctl.py restart` 一次完成"换代"，之后全自动；自动重启失败（端口被占）时 `panel_ctl.py upgrade` → `restart` → 换端口三选一。
+- `panel_ctl.py status` 给出「运行中 build / 磁盘 build」，**该 build 只哈希页面源码（`PAGE`）**，不一致即改动未生效；但它对 `humanize.py` / `progress.py` 这类运行期模块的变化**不敏感**——"面板没变但 status 报一致 ✅"时，先怀疑热更新指纹（见 DEVLOG v1.0.61）。
 - 看板标题 `📊 {SKILL.md 中文名} Ver:{version}`——启动时从 frontmatter 读，改版本号热更一下标题就跟着变。
 - 陈旧判定：running 超 15 分钟无更新 → 显示「疑似已结束」；SessionStart 清 3 天前的已结束任务。
 - 速率口径：需 ≥2 采样点 + 跨度 ≥20 秒 + `done` 有增长；`total=1` 或全程 `done` 不动**天然无速率**（是口径不是故障），此时改用细分计数或 `planned_sec`。
@@ -150,7 +205,9 @@ python scripts/progress.py list --running   # 验收：本轮是否还有卡在�
 - `scripts/panel_ctl.py`：开关控制器（严格探活 / WMI 会话外启动 / 脱离会话校验）
 - `scripts/progress_bridge.py`：状态文件桥接（轮询上报 + 停更收尾 + settle）
 - hooks：`hook_bg.py`（后台登记 + 自动拉面板 + 完成回填）、`hook_prompt.py`（建会话卡 + 回合提醒，20 秒限频桶）、`hook_auto_step.py`（工具调用自动成步骤）、`hook_stop.py`（Stop 强制开面板 / SessionEnd 收）、`hook_session.py`（**会话启动即拉起面板** + 收异常中断卡 + 注入约定）、`install_hooks.py`（各事件 matcher 全用 `*`，覆盖 WB 重启后的会话恢复）
-- `scripts/check_update.py`：版本自更新；`_test_check_update.py`（自更新离线自测，`docs/update-test.md`）、`_test_logcount.py`（日志累计行数单调性离线自测）；`_demo_jobs.py` / `_probe_marquee.py` / `_test_hook.py`（演示与自测，可删）
+- `scripts/app_icons.py`：**应用自带单色 SVG 图标表**（v1.0.63，从 `app.asar` 的 `wb-components/Icon/icons/*.tsx` 原样照搬；`APP_ICONS` 内层节点 + `APP_ICON_BOX` viewBox + `APP_ICON_ATTRS` svg 层属性）——**生成物勿手改**，重抽跑 `scripts/_probe_gen_app_icons.py <asar> app_icons.py <组件名…>`
+- `scripts/humanize.py`：「人话化」词典（命令行→在干什么、助手正文→单行中文、类型图标 key）——**步骤条 / 面板载荷 / 会话内容都用这一套**，别在调用方各写一份；总开关 `LIVE_PROGRESS_HUMANIZE=0`；日志**不走**它（保留原始命令给专业人员排障）
+- `scripts/check_update.py`：版本自更新；`_test_check_update.py`（自更新离线自测，`docs/update-test.md`）、`_test_logcount.py`（日志累计行数单调性，**自隔离**）、`_test_humanize.py`（人话/图标契约）、`_test_reply_contract.py`（会话内容存储契约）、`_test_stream_contract.py`（会话流逐条抓取契约）、`_probe_transcript.py`（transcript 取证：`shape` / `stream` / `turns` / `line` / `fc` / `attach` / `user`）、`_probe_reply_rows.py` / `_probe_real_panel.py`（会话内容区渲染体检）、`_probe_panel_head.py`（抓真面板 HTML 头：标题版本号 / `\x01`·`\x08` 残留 / `/api/jobs` 顶层 `stream_kinds`，**验"磁盘改了线上有没有变"的权威口径**）、`_debug_reset_reply.py`（卡口径重置重同步）；`_demo_jobs.py` / `_probe_marquee.py` / `_test_hook.py`（演示与自测，可删）
 - `docs/update-test.md`：自更新链路自检手册（开发用，**AI 工作流程不看这里**；**开发内容，两个发布渠道都不外发**）
 - `docs/DEVLOG.md`：版本演进与踩坑记录（开发级，**AI 工作流程不看这里**；两个发布渠道都不外发）
 - **文档分级铁律（2026-10-03 用户定策）**：`SKILL.md`（给 AI 的流程）+ `README.md`（给用户的功能介绍）= **产品级**，SkillHub 与 GitHub Release 都带；

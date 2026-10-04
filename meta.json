@@ -1,7 +1,7 @@
 {
   "id": "xueren-workbuddy-live-progress",
   "name": "雪人老师·[WorkBuddy]任务执行进度·实时面板",
-  "version": "1.0.53",
+  "version": "1.0.67",
   "author": "雪人",
   "platforms": [
     "WorkBuddy"
@@ -9,5 +9,5 @@
   "description": "WorkBuddy 会话任务通用「任务执行进度·实时面板」。当启动任何耗时/后台任务（Bash run_in_background、长脚本、镜像/导出/爬取等）时使用；hook 自动登记任务并提醒打开面板，Python 脚本一行接入精确进度。",
   "github": "https://github.com/JackieZheng/xueren-workbuddy-live-progress",
   "agent_created": true,
-  "updated_at": "2026-10-03"
+  "updated_at": "2026-10-04"
 }
