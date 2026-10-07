@@ -1,0 +1,4 @@
+# 统一行尾，避免「tarball 覆盖后行尾不一致」导致的假 diff
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
